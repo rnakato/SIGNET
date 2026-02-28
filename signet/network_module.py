@@ -164,16 +164,13 @@ def normalize_partition(partition):
     if isinstance(partition, dict):
         return partition
 
-    # 2. leidenalg / igraph の partition object
-    #    例: VertexPartition, VertexClustering
     if hasattr(partition, "membership"):
         return {i: comm for i, comm in enumerate(partition.membership)}
 
-    # 3. list / tuple / np.ndarray など
     try:
         return {i: comm for i, comm in enumerate(partition)}
-    except TypeError:
-        raise TypeError(f"Unsupported partition type: {type(partition)}")
+    except TypeError as exc:
+        raise TypeError(f"Unsupported partition type: {type(partition)}") from exc
 
 
 def to_networkx_graph(graph: Union[nx.Graph, ig.Graph]) -> nx.Graph:
@@ -423,14 +420,13 @@ def _draw_signed_subgraphs(
     title=None,
     name_attr="name",
     match_attr="gene_id",
+    layout="spring",
     layout_seed=10,
-    figsize=(8, 6),
+    figsize=(10, 8),
+    node_size=500,
+    font_size=10,
+    label_top_n=None,
 ):
-    """
-    Nodes are matched/highlighted by attribute value (e.g. gene_id),
-    not by raw node index, so this works even when igraph vertex IDs
-    differ between positive and negative graphs.
-    """
     pos_nx = to_networkx_graph(pos_subgraph)
     neg_nx = to_networkx_graph(neg_subgraph)
 
@@ -442,41 +438,72 @@ def _draw_signed_subgraphs(
     combined_graph.add_edges_from(pos_nx.edges())
     combined_graph.add_edges_from(neg_nx.edges())
 
+    # layout
+    if layout == "spring":
+        pos = nx.spring_layout(
+            combined_graph,
+            seed=layout_seed,
+            k=2.0 / np.sqrt(max(combined_graph.number_of_nodes(), 2)),
+            iterations=300,
+        )
+    elif layout == "kamada_kawai":
+        pos = nx.kamada_kawai_layout(combined_graph)
+    else:
+        pos = nx.spring_layout(combined_graph, seed=layout_seed)
+
     plt.figure(figsize=figsize)
-    pos = nx.spring_layout(combined_graph, seed=layout_seed)
 
-    labels = {
-        node: combined_graph.nodes[node].get(name_attr, str(node))
-        for node in combined_graph.nodes()
-    }
-
+    # node colors
     node_colors = []
     for node in combined_graph.nodes():
         attrs = combined_graph.nodes[node]
         key = attrs.get(match_attr, attrs.get(name_attr, node))
         node_colors.append("red" if key in highlight_keys else "lightblue")
 
-    nx.draw_networkx_nodes(combined_graph, pos, node_color=node_colors, node_size=500)
+    # labels: optionally only top-degree nodes
+    if label_top_n is None:
+        label_nodes = set(combined_graph.nodes())
+    else:
+        degree_rank = sorted(combined_graph.degree(), key=lambda x: x[1], reverse=True)
+        label_nodes = {n for n, _ in degree_rank[:label_top_n]}
+
+    labels = {
+        node: combined_graph.nodes[node].get(name_attr, str(node))
+        for node in label_nodes
+    }
+
+    nx.draw_networkx_nodes(
+        combined_graph,
+        pos,
+        node_color=node_colors,
+        node_size=node_size,
+        alpha=0.9,
+    )
     nx.draw_networkx_edges(
         combined_graph,
         pos,
         edgelist=list(pos_nx.edges()),
-        edge_color="pink",
-        width=2,
-        alpha=0.7,
+        edge_color="red",
+        width=1.5,
+        alpha=0.35,
     )
     nx.draw_networkx_edges(
         combined_graph,
         pos,
         edgelist=list(neg_nx.edges()),
         edge_color="blue",
-        width=2,
-        alpha=0.7,
+        width=1.5,
+        alpha=0.35,
     )
-    nx.draw_networkx_labels(combined_graph, pos, labels=labels, font_size=12)
+    nx.draw_networkx_labels(
+        combined_graph,
+        pos,
+        labels=labels,
+        font_size=font_size,
+    )
 
     legend_elements = [
-        Line2D([0], [0], color="pink", lw=2, label="Positive edge"),
+        Line2D([0], [0], color="red", lw=2, label="Positive edge"),
         Line2D([0], [0], color="blue", lw=2, label="Negative edge"),
     ]
     plt.legend(handles=legend_elements)
@@ -485,6 +512,7 @@ def _draw_signed_subgraphs(
         plt.title(title)
 
     plt.axis("off")
+    plt.tight_layout()
     plt.show()
 
 # =============================================================================
@@ -744,47 +772,50 @@ def visualize_module_signed(
 
     Positive edges are shown in red, negative edges in blue.
 
-    Parameters
-    ----------
-    pos_graph : networkx.Graph or igraph.Graph
-        Positive graph.
-    neg_graph : networkx.Graph or igraph.Graph
-        Negative graph.
-    partition : dict, list-like, or Leiden/igraph partition object
-        Community assignment. It should correspond to the positive graph
-        or to an aligned graph whose node order matches the positive graph.
-    community_id : int
-        Target community ID to visualize.
-    name_attr : str
-        Node attribute used for labels.
-    match_attr : str
-        Node attribute used to match positive/negative graphs, usually gene_id.
+    If `partition` is a Leiden/igraph partition object, its vertex indices are
+    interpreted on `partition.graph`, then mapped back to pos_graph/neg_graph
+    using `match_attr` (default: gene_id).
     """
     normalized = normalize_partition(partition)
-    pos_nodes = [node for node, comm in normalized.items() if comm == community_id]
 
-    if not pos_nodes:
+    # partition object が持つ元グラフ（aligned graph）上の node IDs
+    part_graph = partition.graph if hasattr(partition, "graph") else pos_graph
+
+    # community に属する node IDs を partition 側の graph 上で取得
+    part_nodes = [node for node, comm in normalized.items() if comm == community_id]
+
+    if not part_nodes:
         print(f"Community {community_id} is empty or not found.")
         return
 
-    pos_subgraph = subgraph_by_nodes(pos_graph, pos_nodes)
-
-    # positive graph 側の node を match_attr で negative graph 側へ写像
-    pos_match_keys = {
+    # partition graph 上の node -> match key（通常 gene_id）
+    part_match_keys = {
         get_node_attr(
-            pos_graph,
+            part_graph,
             node,
             match_attr,
-            get_node_attr(pos_graph, node, name_attr, node),
+            get_node_attr(part_graph, node, name_attr, node),
         )
-        for node in pos_nodes
+        for node in part_nodes
     }
 
+    # pos_graph / neg_graph 側へ写像
+    pos_match_map = build_attr_to_node_map(pos_graph, match_attr)
     neg_match_map = build_attr_to_node_map(neg_graph, match_attr)
+
+    if not pos_match_map and match_attr != name_attr:
+        pos_match_map = build_attr_to_node_map(pos_graph, name_attr)
     if not neg_match_map and match_attr != name_attr:
         neg_match_map = build_attr_to_node_map(neg_graph, name_attr)
 
-    neg_nodes = [neg_match_map[key] for key in pos_match_keys if key in neg_match_map]
+    pos_nodes = [pos_match_map[key] for key in part_match_keys if key in pos_match_map]
+    neg_nodes = [neg_match_map[key] for key in part_match_keys if key in neg_match_map]
+
+    if not pos_nodes:
+        print(f"Community {community_id} could not be mapped onto the positive graph.")
+        return
+
+    pos_subgraph = subgraph_by_nodes(pos_graph, pos_nodes)
     neg_subgraph = subgraph_by_nodes(neg_graph, neg_nodes)
 
     _draw_signed_subgraphs(
@@ -792,6 +823,8 @@ def visualize_module_signed(
         neg_subgraph,
         highlight_keys=set(),
         title=f"Module {community_id}",
+        layout="kamada_kawai",
+        figsize=(14, 12),
         name_attr=name_attr,
         match_attr=match_attr,
     )
@@ -829,23 +862,45 @@ def visualize_module_of_gene_signed(
 ):
     """
     Visualize the signed module/community containing the specified gene.
+
+    Works for dict/list partitions and Leiden partition objects.
     """
     normalized = normalize_partition(partition)
-    node = find_node_by_attr(pos_graph, name_attr, gene_name)
 
-    if node is None:
+    # pos_graph 側で query gene を探す
+    pos_node = find_node_by_attr(pos_graph, name_attr, gene_name)
+    if pos_node is None:
         print(f"No gene named {gene_name} found in the positive graph.")
         return
 
-    if node not in normalized:
+    query_key = get_node_attr(
+        pos_graph,
+        pos_node,
+        match_attr,
+        get_node_attr(pos_graph, pos_node, name_attr, gene_name),
+    )
+
+    # partition 側 graph 上で同じ match_attr を持つ node を探す
+    part_graph = partition.graph if hasattr(partition, "graph") else pos_graph
+    part_node = find_node_by_attr(part_graph, match_attr, query_key)
+
+    if part_node is None and match_attr != name_attr:
+        part_node = find_node_by_attr(part_graph, name_attr, gene_name)
+
+    if part_node is None:
+        print(f"No matching node for gene {gene_name} found in the partition graph.")
+        return
+
+    if part_node not in normalized:
         print(f"No community assignment found for gene {gene_name}.")
         return
 
-    community_id = normalized[node]
+    community_id = normalized[part_node]
+
     visualize_module_signed(
         pos_graph,
         neg_graph,
-        normalized,
+        partition,
         community_id,
         name_attr=name_attr,
         match_attr=match_attr,
@@ -908,36 +963,53 @@ def visualize_module_top_degree_nodes_signed(
     Top-N ranking is computed within the positive graph's module subgraph.
     Positive edges are shown in red and negative edges in blue.
 
-    Parameters
-    ----------
-    pos_graph : networkx.Graph or igraph.Graph
-        Positive graph.
-    neg_graph : networkx.Graph or igraph.Graph
-        Negative graph.
-    partition : dict, list-like, or Leiden/igraph partition object
-        Community assignment corresponding to the positive graph.
-    community_id : int
-        Target community ID.
-    top_n : int
-        Number of highest-degree nodes to keep within the module.
-    name_attr : str
-        Node attribute used for labels.
-    match_attr : str
-        Node attribute used to match positive/negative graphs.
+    This function supports Leiden partition objects whose node indices belong
+    to partition.graph, not necessarily to pos_graph / neg_graph directly.
     """
     normalized = normalize_partition(partition)
-    pos_nodes = [node for node, comm in normalized.items() if comm == community_id]
+    part_graph = partition.graph if hasattr(partition, "graph") else pos_graph
 
-    if not pos_nodes:
+    # partition 側 graph 上で community のノードを取得
+    part_nodes = [node for node, comm in normalized.items() if comm == community_id]
+
+    if not part_nodes:
         print(f"Community {community_id} is empty or not found.")
         return
 
+    # partition graph 上の node -> match key（通常 gene_id）
+    part_match_keys = {
+        get_node_attr(
+            part_graph,
+            node,
+            match_attr,
+            get_node_attr(part_graph, node, name_attr, node),
+        )
+        for node in part_nodes
+    }
+
+    # pos_graph / neg_graph 側へ写像
+    pos_match_map = build_attr_to_node_map(pos_graph, match_attr)
+    neg_match_map = build_attr_to_node_map(neg_graph, match_attr)
+
+    if not pos_match_map and match_attr != name_attr:
+        pos_match_map = build_attr_to_node_map(pos_graph, name_attr)
+    if not neg_match_map and match_attr != name_attr:
+        neg_match_map = build_attr_to_node_map(neg_graph, name_attr)
+
+    pos_nodes = [pos_match_map[key] for key in part_match_keys if key in pos_match_map]
+    neg_nodes = [neg_match_map[key] for key in part_match_keys if key in neg_match_map]
+
+    if not pos_nodes:
+        print(f"Community {community_id} could not be mapped onto the positive graph.")
+        return
+
+    # positive graph 側で module subgraph を作り、その中で degree 上位 N を選ぶ
     pos_module_subgraph = subgraph_by_nodes(pos_graph, pos_nodes)
     top_nodes_pos = _top_degree_nodes(pos_module_subgraph, top_n)
     pos_top_subgraph = subgraph_by_nodes(pos_module_subgraph, top_nodes_pos)
 
-    # positive graph 側の top node を属性値で negative graph 側へ対応付け
-    pos_match_keys = {
+    # 選ばれた positive 側 top nodes を negative 側へ再マップ
+    top_match_keys = {
         get_node_attr(
             pos_graph,
             node,
@@ -947,12 +1019,8 @@ def visualize_module_top_degree_nodes_signed(
         for node in top_nodes_pos
     }
 
-    neg_match_map = build_attr_to_node_map(neg_graph, match_attr)
-    if not neg_match_map and match_attr != name_attr:
-        neg_match_map = build_attr_to_node_map(neg_graph, name_attr)
-
-    neg_nodes = [neg_match_map[key] for key in pos_match_keys if key in neg_match_map]
-    neg_top_subgraph = subgraph_by_nodes(neg_graph, neg_nodes)
+    neg_top_nodes = [neg_match_map[key] for key in top_match_keys if key in neg_match_map]
+    neg_top_subgraph = subgraph_by_nodes(neg_graph, neg_top_nodes)
 
     _draw_signed_subgraphs(
         pos_top_subgraph,
@@ -962,6 +1030,7 @@ def visualize_module_top_degree_nodes_signed(
         name_attr=name_attr,
         match_attr=match_attr,
     )
+
 
 def visualize_module_of_gene_top_degree_nodes(
     graph,
@@ -1004,23 +1073,45 @@ def visualize_module_of_gene_top_degree_nodes_signed(
 ):
     """
     Visualize top-N degree nodes within the signed module containing the given gene.
+
+    Works for dict/list partitions and Leiden partition objects.
     """
     normalized = normalize_partition(partition)
-    node = find_node_by_attr(pos_graph, name_attr, gene_name)
 
-    if node is None:
+    # pos_graph 側で query gene を探す
+    pos_node = find_node_by_attr(pos_graph, name_attr, gene_name)
+    if pos_node is None:
         print(f"No gene named {gene_name} found in the positive graph.")
         return
 
-    if node not in normalized:
+    query_key = get_node_attr(
+        pos_graph,
+        pos_node,
+        match_attr,
+        get_node_attr(pos_graph, pos_node, name_attr, gene_name),
+    )
+
+    # partition 側 graph 上で同じ遺伝子を探す
+    part_graph = partition.graph if hasattr(partition, "graph") else pos_graph
+    part_node = find_node_by_attr(part_graph, match_attr, query_key)
+
+    if part_node is None and match_attr != name_attr:
+        part_node = find_node_by_attr(part_graph, name_attr, gene_name)
+
+    if part_node is None:
+        print(f"No matching node for gene {gene_name} found in the partition graph.")
+        return
+
+    if part_node not in normalized:
         print(f"No community assignment found for gene {gene_name}.")
         return
 
-    community_id = normalized[node]
+    community_id = normalized[part_node]
+
     visualize_module_top_degree_nodes_signed(
         pos_graph,
         neg_graph,
-        normalized,
+        partition,
         community_id,
         top_n=top_n,
         name_attr=name_attr,
