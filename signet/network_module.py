@@ -1,6 +1,7 @@
 import numpy as np
 import networkx as nx
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import igraph as ig
 
 def load_graph_from_EEISP(filename, threshold):
@@ -55,7 +56,262 @@ def load_graph_from_EEISP_igraph(filename, threshold):
 
     return g
 
+def get_subgraph_by_community(graph, communities, community_id):
+    nodes_in_community = [node for node, comm_id in communities.items() if comm_id == community_id]
+    subgraph = graph.subgraph(nodes_in_community)
 
+    return subgraph
+
+def check_graph_weights(G):
+    weights = [data.get('weight', 1) for _, _, data in G.edges(data=True)]
+
+    if not weights:
+        return "no edges"
+    elif all('weight' in data for _, _, data in G.edges(data=True)):
+        if len(set(weights)) == 1:
+            return "unweighted"
+        else:
+            return "weighted"
+    else:
+        return "partially weighted"
+
+def display_communities_by_name(graph, partition):
+    community_dict = {}
+    for node, community in partition.items():
+        gene_name = graph.nodes[node]['name']
+        if community not in community_dict:
+            community_dict[community] = []
+        community_dict[community].append(gene_name)
+
+    for community, names in community_dict.items():
+        print(f'Community {community}: {" | ".join(set(names))}')
+
+
+def find_communities_of_genes(graph, partition, gene_names):
+    results = {}
+    for gene_name in gene_names:
+        node_id = next((node for node, data in graph.nodes(data=True) if data['name'] == gene_name), None)
+        if node_id is None:
+            results[gene_name] = "Gene not found in the graph."
+            continue
+        community_id = partition.get(node_id, None)
+        if community_id is None:
+            results[gene_name] = "Community for gene not found."
+        else:
+            results[gene_name] = community_id
+    return results
+
+def visualize_top_weighted_nodes(graph, gene_name, top_n):
+    gene_id = None
+    for node, data in graph.nodes(data=True):
+        if data['name'] == gene_name:
+            gene_id = node
+            break
+
+    if gene_id is None:
+        print(f"No gene named {gene_name} found in the graph.")
+        return
+
+    edges = [(gene_id, neighbor, data['weight']) for neighbor, data in graph[gene_id].items()]
+
+    top_edges = sorted(edges, key=lambda x: x[2], reverse=True)[:top_n]
+
+    top_nodes = {edge[1] for edge in top_edges}
+    top_nodes.add(gene_id)
+    subgraph = graph.subgraph(top_nodes)
+
+    pos = nx.spring_layout(subgraph)
+    labels = {n: graph.nodes[n]['name'] for n in subgraph.nodes()}
+
+    node_colors = ['red' if node == gene_id else 'lightblue' for node in subgraph.nodes()]
+
+    nx.draw(subgraph, pos, labels=labels, with_labels=True, node_color=node_colors, edge_color='gray', node_size=500, font_size=12)
+    plt.title(f"Top {top_n} genes connections to {gene_name}")
+    plt.show()
+
+def visualize_top_weighted_nodes_signed(pos_graph, neg_graph, gene_name, top_n):
+    gene_id = None
+
+    # gene_name から node id を探す
+    for node, data in pos_graph.nodes(data=True):
+        if data.get('name') == gene_name:
+            gene_id = node
+            break
+
+    if gene_id is None:
+        print(f"No gene named {gene_name} found in the positive graph.")
+        return
+
+    # top genes の計算は今まで通り positive graph だけで行う
+    edges = [
+        (gene_id, neighbor, data.get('weight', 1))
+        for neighbor, data in pos_graph[gene_id].items()
+    ]
+
+    top_edges = sorted(edges, key=lambda x: x[2], reverse=True)[:top_n]
+
+    top_nodes = {edge[1] for edge in top_edges}
+    top_nodes.add(gene_id)
+
+    # 可視化対象の部分グラフ
+    pos_subgraph = pos_graph.subgraph(top_nodes)
+    neg_subgraph = neg_graph.subgraph(top_nodes)
+
+    # レイアウト計算用に union graph を作る
+    combined_graph = nx.Graph()
+    combined_graph.add_nodes_from(top_nodes)
+    combined_graph.add_edges_from(pos_subgraph.edges())
+    combined_graph.add_edges_from(neg_subgraph.edges())
+
+    pos = nx.spring_layout(combined_graph)
+    labels = {n: pos_graph.nodes[n].get('name', str(n)) for n in combined_graph.nodes()}
+    node_colors = ['red' if node == gene_id else 'lightblue' for node in combined_graph.nodes()]
+
+    plt.figure(figsize=(8, 6))
+    nx.draw_networkx_nodes(
+        combined_graph,
+        pos,
+        node_color=node_colors,
+        node_size=500
+    )
+    nx.draw_networkx_edges(
+        combined_graph,
+        pos,
+        edgelist=list(pos_subgraph.edges()),
+        edge_color='pink',
+        width=2
+    )
+    nx.draw_networkx_edges(
+        combined_graph,
+        pos,
+        edgelist=list(neg_subgraph.edges()),
+        edge_color='blue',
+        width=2
+    )
+    nx.draw_networkx_labels(
+        combined_graph,
+        pos,
+        labels=labels,
+        font_size=12
+    )
+    legend_elements = [
+        Line2D([0], [0], color='pink', lw=2, label='Positive edge'),
+        Line2D([0], [0], color='blue', lw=2, label='Negative edge')
+    ]
+    plt.legend(handles=legend_elements)
+
+    plt.title(f"Top {top_n} genes connections to {gene_name}")
+    plt.axis('off')
+    plt.show()
+
+def visualize_top_weighted_nodes_between_genes(graph, gene_names, top_n):
+    gene_ids = []
+    for node, data in graph.nodes(data=True):
+        if data['name'] in gene_names:
+            gene_ids.append(node)
+
+    if len(gene_ids) != len(gene_names):
+        print("Some genes not found in the graph.")
+        return
+
+    node_weights = {}
+    for gene_id in gene_ids:
+        for neighbor in graph.neighbors(gene_id):
+            if neighbor not in node_weights:
+                node_weights[neighbor] = 0
+            node_weights[neighbor] += graph[gene_id][neighbor]['weight']
+
+    top_nodes = sorted(node_weights, key=node_weights.get, reverse=True)[:top_n]
+
+    subgraph_nodes = set(top_nodes).union(set(gene_ids))
+    subgraph = graph.subgraph(subgraph_nodes)
+
+    pos = nx.spring_layout(subgraph)
+    node_colors = ['red' if node in gene_ids else 'lightblue' for node in subgraph.nodes()]
+
+    nx.draw_networkx_nodes(subgraph, pos, node_color=node_colors, node_size=500)
+    nx.draw_networkx_edges(subgraph, pos, alpha=0.5)
+    nx.draw_networkx_labels(subgraph, pos, labels={n: subgraph.nodes[n]['name'] for n in subgraph.nodes()})
+
+    plt.title(f"Top {top_n} Weighted Connections for {', '.join(gene_names)}")
+    plt.axis('off')
+    plt.show()
+
+def visualize_top_weighted_nodes_between_genes_signed(pos_graph, neg_graph, gene_names, top_n):
+    gene_ids = []
+
+    # gene_names から node id を探す
+    for node, data in pos_graph.nodes(data=True):
+        if data.get('name') in gene_names:
+            gene_ids.append(node)
+
+    if len(gene_ids) != len(gene_names):
+        print("Some genes not found in the positive graph.")
+        return
+
+    # top nodes の計算は今まで通り positive graph だけで行う
+    node_weights = {}
+    for gene_id in gene_ids:
+        for neighbor in pos_graph.neighbors(gene_id):
+            if neighbor not in node_weights:
+                node_weights[neighbor] = 0
+            node_weights[neighbor] += pos_graph[gene_id][neighbor].get('weight', 1)
+
+    top_nodes = sorted(node_weights, key=node_weights.get, reverse=True)[:top_n]
+
+    subgraph_nodes = set(top_nodes).union(set(gene_ids))
+
+    pos_subgraph = pos_graph.subgraph(subgraph_nodes)
+    neg_subgraph = neg_graph.subgraph(subgraph_nodes)
+
+    # レイアウト計算用に union graph を作る
+    combined_graph = nx.Graph()
+    combined_graph.add_nodes_from(subgraph_nodes)
+    combined_graph.add_edges_from(pos_subgraph.edges())
+    combined_graph.add_edges_from(neg_subgraph.edges())
+
+    pos = nx.spring_layout(combined_graph)
+    node_colors = ['red' if node in gene_ids else 'lightblue' for node in combined_graph.nodes()]
+    labels = {n: pos_graph.nodes[n].get('name', str(n)) for n in combined_graph.nodes()}
+
+    plt.figure(figsize=(8, 6))
+    nx.draw_networkx_nodes(
+        combined_graph,
+        pos,
+        node_color=node_colors,
+        node_size=500
+    )
+    nx.draw_networkx_edges(
+        combined_graph,
+        pos,
+        edgelist=list(pos_subgraph.edges()),
+        edge_color='pink',
+        width=2,
+        alpha=0.7
+    )
+    nx.draw_networkx_edges(
+        combined_graph,
+        pos,
+        edgelist=list(neg_subgraph.edges()),
+        edge_color='blue',
+        width=2,
+        alpha=0.7
+    )
+    nx.draw_networkx_labels(
+        combined_graph,
+        pos,
+        labels=labels,
+        font_size=12
+    )
+    legend_elements = [
+        Line2D([0], [0], color='pink', lw=2, label='Positive edge'),
+        Line2D([0], [0], color='blue', lw=2, label='Negative edge')
+    ]
+    plt.legend(handles=legend_elements)
+
+    plt.title(f"Top {top_n} Weighted Connections for {', '.join(gene_names)}")
+    plt.axis('off')
+    plt.show()
 
 def count_nodes_in_communities(partition):
     community_counts = {}
