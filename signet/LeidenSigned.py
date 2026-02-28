@@ -173,23 +173,18 @@ def find_partition_signed_CPM(
     return part_pos
 
 
-def find_partition_signed_modularity(
+def _find_partition_signed_modularity_core(
     G_pos,
     G_neg,
-    alpha=1,
-    res_pos=1.0,
-    res_neg=1.0,
-    seed=None,
+    *,
+    resolution=1.0,
+    w_pos=1.0,
+    w_neg=-1.0,
     gene_id_attr="gene_id",
     name_attr="name",
-    return_both=False
+    return_both=False,
+    seed=None,
 ):
-    """
-    Signed Leiden using RBConfigurationVertexPartition.
-
-    Input graphs may be NetworkX or igraph.
-    Returns partitions on aligned igraph graphs.
-    """
     aligned_G_pos, aligned_G_neg = align_graphs(
         G_pos,
         G_neg,
@@ -201,7 +196,7 @@ def find_partition_signed_modularity(
         aligned_G_pos,
         la.RBConfigurationVertexPartition,
         weights="weight" if "weight" in aligned_G_pos.es.attributes() else None,
-        resolution_parameter=res_pos,
+        resolution_parameter=resolution,
         seed=seed,
     )
 
@@ -209,7 +204,7 @@ def find_partition_signed_modularity(
         aligned_G_neg,
         la.RBConfigurationVertexPartition,
         weights="weight" if "weight" in aligned_G_neg.es.attributes() else None,
-        resolution_parameter=res_neg,
+        resolution_parameter=resolution,
         seed=seed,
     )
 
@@ -221,12 +216,65 @@ def find_partition_signed_modularity(
     while diff > 0:
         diff = optimiser.optimise_partition_multiplex(
             [part_pos, part_neg],
-            layer_weights=[alpha, -(1-alpha)]
+            layer_weights=[w_pos, w_neg],
         )
 
     if return_both:
         return part_pos, part_neg
     return part_pos
+
+def find_partition_signed_modularity_alpha(
+    G_pos,
+    G_neg,
+    *,
+    resolution=1.0,
+    alpha=1.0,
+    gene_id_attr="gene_id",
+    name_attr="name",
+    return_both=False,
+    seed=None,
+):
+    if not (0.0 <= alpha <= 1.0):
+        raise ValueError(f"alpha must be between 0 and 1, got {alpha}")
+
+    return _find_partition_signed_modularity_core(
+        G_pos,
+        G_neg,
+        resolution=resolution,
+        w_pos=alpha,
+        w_neg=-(1.0 - alpha),
+        gene_id_attr=gene_id_attr,
+        name_attr=name_attr,
+        return_both=return_both,
+        seed=seed,
+    )
+
+def find_partition_signed_modularity_lambda(
+    G_pos,
+    G_neg,
+    *,
+    resolution=1.0,
+    lambda_neg=0.0,
+    gene_id_attr="gene_id",
+    name_attr="name",
+    return_both=False,
+    seed=None,
+):
+    if lambda_neg < 0.0:
+        raise ValueError(f"lambda_neg must be non-negative, got {lambda_neg}")
+
+    return _find_partition_signed_modularity_core(
+        G_pos,
+        G_neg,
+        resolution=resolution,
+        w_pos=1.0,
+        w_neg=-lambda_neg,
+        gene_id_attr=gene_id_attr,
+        name_attr=name_attr,
+        return_both=return_both,
+        seed=seed,
+    )
+
 
 
 def find_partition_signed_ModularityVertexPartition(

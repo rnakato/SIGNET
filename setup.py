@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="signet",
-    version="0.3.10", # for test
+    version="0.4.0", # for test
 #    version="0.1.0", # for PyPI
     license="GPL3.0",
     install_requires=[

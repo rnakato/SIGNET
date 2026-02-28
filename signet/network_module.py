@@ -477,7 +477,7 @@ def _draw_signed_subgraphs(
         pos,
         node_color=node_colors,
         node_size=node_size,
-        alpha=0.9,
+        alpha=0.8,
     )
     nx.draw_networkx_edges(
         combined_graph,
@@ -1072,48 +1072,117 @@ def visualize_module_of_gene_top_degree_nodes_signed(
     match_attr="gene_id",
 ):
     """
-    Visualize top-N degree nodes within the signed module containing the given gene.
+    Visualize the signed module containing the given gene, keeping:
+
+    - the query/key gene node აუცილებლად
+    - plus top-N highest-degree nodes within that module
+
+    Positive edges are shown in red and negative edges in blue.
 
     Works for dict/list partitions and Leiden partition objects.
     """
     normalized = normalize_partition(partition)
 
-    # pos_graph 側で query gene を探す
-    pos_node = find_node_by_attr(pos_graph, name_attr, gene_name)
-    if pos_node is None:
+    # 1. Find the query node in the positive graph
+    pos_query_node = find_node_by_attr(pos_graph, name_attr, gene_name)
+    if pos_query_node is None:
         print(f"No gene named {gene_name} found in the positive graph.")
         return
 
     query_key = get_node_attr(
         pos_graph,
-        pos_node,
+        pos_query_node,
         match_attr,
-        get_node_attr(pos_graph, pos_node, name_attr, gene_name),
+        get_node_attr(pos_graph, pos_query_node, name_attr, gene_name),
     )
 
-    # partition 側 graph 上で同じ遺伝子を探す
+    # 2. Find the corresponding node in the partition graph
     part_graph = partition.graph if hasattr(partition, "graph") else pos_graph
-    part_node = find_node_by_attr(part_graph, match_attr, query_key)
+    part_query_node = find_node_by_attr(part_graph, match_attr, query_key)
 
-    if part_node is None and match_attr != name_attr:
-        part_node = find_node_by_attr(part_graph, name_attr, gene_name)
+    if part_query_node is None and match_attr != name_attr:
+        part_query_node = find_node_by_attr(part_graph, name_attr, gene_name)
 
-    if part_node is None:
+    if part_query_node is None:
         print(f"No matching node for gene {gene_name} found in the partition graph.")
         return
 
-    if part_node not in normalized:
+    if part_query_node not in normalized:
         print(f"No community assignment found for gene {gene_name}.")
         return
 
-    community_id = normalized[part_node]
+    community_id = normalized[part_query_node]
 
-    visualize_module_top_degree_nodes_signed(
-        pos_graph,
-        neg_graph,
-        partition,
-        community_id,
-        top_n=top_n,
+    # 3. Get all nodes in the community on the partition graph
+    part_nodes = [node for node, comm in normalized.items() if comm == community_id]
+    if not part_nodes:
+        print(f"Community {community_id} is empty or not found.")
+        return
+
+    # 4. Map community nodes from partition graph to positive/negative graphs
+    part_match_keys = {
+        get_node_attr(
+            part_graph,
+            node,
+            match_attr,
+            get_node_attr(part_graph, node, name_attr, node),
+        )
+        for node in part_nodes
+    }
+
+    pos_match_map = build_attr_to_node_map(pos_graph, match_attr)
+    neg_match_map = build_attr_to_node_map(neg_graph, match_attr)
+
+    if not pos_match_map and match_attr != name_attr:
+        pos_match_map = build_attr_to_node_map(pos_graph, name_attr)
+    if not neg_match_map and match_attr != name_attr:
+        neg_match_map = build_attr_to_node_map(neg_graph, name_attr)
+
+    pos_nodes = [pos_match_map[key] for key in part_match_keys if key in pos_match_map]
+    if not pos_nodes:
+        print(f"Community {community_id} could not be mapped onto the positive graph.")
+        return
+
+    # 5. Build positive module subgraph and rank by degree
+    pos_module_subgraph = subgraph_by_nodes(pos_graph, pos_nodes)
+    ranked_nodes = _top_degree_nodes(pos_module_subgraph, None)  # all nodes ranked
+
+    # keep query node + topN others
+    top_nodes_pos = []
+    for node in ranked_nodes:
+        if node != pos_query_node:
+            top_nodes_pos.append(node)
+        if len(top_nodes_pos) >= top_n:
+            break
+
+    selected_pos_nodes = [pos_query_node] + top_nodes_pos
+
+    # remove accidental duplicates while preserving order
+    seen = set()
+    selected_pos_nodes = [n for n in selected_pos_nodes if not (n in seen or seen.add(n))]
+
+    pos_top_subgraph = subgraph_by_nodes(pos_module_subgraph, selected_pos_nodes)
+
+    # 6. Map selected positive nodes to negative graph
+    selected_match_keys = {
+        get_node_attr(
+            pos_graph,
+            node,
+            match_attr,
+            get_node_attr(pos_graph, node, name_attr, node),
+        )
+        for node in selected_pos_nodes
+    }
+
+    neg_selected_nodes = [neg_match_map[key] for key in selected_match_keys if key in neg_match_map]
+    neg_top_subgraph = subgraph_by_nodes(neg_graph, neg_selected_nodes)
+
+    # 7. Draw, highlighting the query node
+    _draw_signed_subgraphs(
+        pos_top_subgraph,
+        neg_top_subgraph,
+        highlight_keys={query_key},
+        title=f"Module {community_id} ({gene_name} + top {len(top_nodes_pos)} by degree)",
         name_attr=name_attr,
         match_attr=match_attr,
     )
