@@ -320,3 +320,17 @@ def find_partition_signed_ModularityVertexPartition(
         )
 
     return part_pos, part_neg
+
+
+def find_partition_signed_CPM_single_graph(
+    G_signed,
+    gamma=0.5,
+    seed=None,
+):
+    return la.find_partition(
+        G_signed,
+        la.CPMVertexPartition,
+        weights="weight",
+        resolution_parameter=gamma,
+        seed=seed,
+    )

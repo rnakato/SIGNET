@@ -267,6 +267,82 @@ def load_graph_from_TSV_igraph(filename: str, threshold: float) -> ig.Graph:
 
     return graph
 
+
+def load_signed_graph_from_two_TSV_igraph(
+    pos_filename,
+    neg_filename,
+    pos_threshold=0.0,
+    neg_threshold=0.0,
+    lambda_neg=1.0,
+):
+    """
+    Build a single signed weighted igraph.Graph from separate positive/negative TSV files.
+
+    Expected TSV columns:
+        gene_id1, gene_id2, gene_name1, gene_name2, weight
+
+    Signed weight is defined as:
+        signed_weight = positive_weight - lambda_neg * negative_weight
+    """
+    edge_weights = {}   # key: (gene_id_low, gene_id_high) -> signed weight
+    gene_name_map = {}  # gene_id -> gene_name
+    gene_ids = set()
+
+    def canonical_pair(a, b):
+        return (a, b) if a <= b else (b, a)
+
+    # Read positive edges
+    with open(pos_filename, "r") as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            gene_id1, gene_id2, gene_name1, gene_name2, weight_str = parts[:5]
+            weight = float(weight_str)
+
+            if weight < pos_threshold:
+                continue
+
+            key = canonical_pair(gene_id1, gene_id2)
+            edge_weights[key] = edge_weights.get(key, 0.0) + weight
+
+            gene_ids.add(gene_id1)
+            gene_ids.add(gene_id2)
+            gene_name_map[gene_id1] = gene_name1
+            gene_name_map[gene_id2] = gene_name2
+
+    # Read negative edges
+    with open(neg_filename, "r") as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            gene_id1, gene_id2, gene_name1, gene_name2, weight_str = parts[:5]
+            weight = float(weight_str)
+
+            if weight < neg_threshold:
+                continue
+
+            key = canonical_pair(gene_id1, gene_id2)
+            edge_weights[key] = edge_weights.get(key, 0.0) - lambda_neg * weight
+
+            gene_ids.add(gene_id1)
+            gene_ids.add(gene_id2)
+            gene_name_map[gene_id1] = gene_name1
+            gene_name_map[gene_id2] = gene_name2
+
+    # Drop exactly-zero edges after cancellation
+    edge_weights = {k: w for k, w in edge_weights.items() if w != 0.0}
+
+    sorted_gene_ids = sorted(gene_ids)
+    id_to_index = {gene_id: idx for idx, gene_id in enumerate(sorted_gene_ids)}
+
+    edge_list = [(id_to_index[u], id_to_index[v]) for (u, v) in edge_weights.keys()]
+    weight_list = list(edge_weights.values())
+
+    g = ig.Graph(n=len(sorted_gene_ids), edges=edge_list, directed=False)
+    g.vs["gene_id"] = sorted_gene_ids
+    g.vs["name"] = [gene_name_map.get(gid, gid) for gid in sorted_gene_ids]
+    g.es["weight"] = weight_list
+
+    return g
+
 # =============================================================================
 # Community / weight utilities
 # =============================================================================
@@ -514,6 +590,7 @@ def _draw_signed_subgraphs(
     plt.axis("off")
     plt.tight_layout()
     plt.show()
+
 
 # =============================================================================
 # Visualization utilities
@@ -1074,7 +1151,7 @@ def visualize_module_of_gene_top_degree_nodes_signed(
     """
     Visualize the signed module containing the given gene, keeping:
 
-    - the query/key gene node აუცილებლად
+    - the query/key gene node
     - plus top-N highest-degree nodes within that module
 
     Positive edges are shown in red and negative edges in blue.
@@ -1143,13 +1220,21 @@ def visualize_module_of_gene_top_degree_nodes_signed(
         print(f"Community {community_id} could not be mapped onto the positive graph.")
         return
 
-    # 5. Build positive module subgraph and rank by degree
-    pos_module_subgraph = subgraph_by_nodes(pos_graph, pos_nodes)
-    ranked_nodes = _top_degree_nodes(pos_module_subgraph, None)  # all nodes ranked
+    pos_node_set = set(pos_nodes)
+
+    # 5. Rank nodes by degree *within the module*, but keep original pos_graph node IDs
+    #    This avoids igraph subgraph-local vertex ID problems.
+    ranked_nodes = []
+    for node in pos_nodes:
+        deg_in_module = sum(1 for nbr in iter_neighbors(pos_graph, node) if nbr in pos_node_set)
+        ranked_nodes.append((node, deg_in_module))
+
+    ranked_nodes.sort(key=lambda x: x[1], reverse=True)
+    ranked_node_ids = [node for node, _ in ranked_nodes]
 
     # keep query node + topN others
     top_nodes_pos = []
-    for node in ranked_nodes:
+    for node in ranked_node_ids:
         if node != pos_query_node:
             top_nodes_pos.append(node)
         if len(top_nodes_pos) >= top_n:
@@ -1161,9 +1246,9 @@ def visualize_module_of_gene_top_degree_nodes_signed(
     seen = set()
     selected_pos_nodes = [n for n in selected_pos_nodes if not (n in seen or seen.add(n))]
 
-    pos_top_subgraph = subgraph_by_nodes(pos_module_subgraph, selected_pos_nodes)
+    # 6. Create subgraphs directly from the original graphs
+    pos_top_subgraph = subgraph_by_nodes(pos_graph, selected_pos_nodes)
 
-    # 6. Map selected positive nodes to negative graph
     selected_match_keys = {
         get_node_attr(
             pos_graph,
