@@ -274,6 +274,7 @@ def load_signed_graph_from_two_TSV_igraph(
     pos_threshold=0.0,
     neg_threshold=0.0,
     lambda_neg=1.0,
+    neg_weight_mode="absolute",  # "absolute" or "signed"
 ):
     """
     Build a single signed weighted igraph.Graph from separate positive/negative TSV files.
@@ -282,16 +283,20 @@ def load_signed_graph_from_two_TSV_igraph(
         gene_id1, gene_id2, gene_name1, gene_name2, weight
 
     Signed weight is defined as:
-        signed_weight = positive_weight - lambda_neg * negative_weight
+        signed_weight = positive_weight + transformed_negative_weight
+
+    where transformed_negative_weight is:
+        -lambda_neg * abs(weight)   if neg_weight_mode == "absolute"
+        lambda_neg * weight         if neg_weight_mode == "signed"
     """
-    edge_weights = {}   # key: (gene_id_low, gene_id_high) -> signed weight
-    gene_name_map = {}  # gene_id -> gene_name
+    edge_weights = {}
+    gene_name_map = {}
     gene_ids = set()
 
     def canonical_pair(a, b):
         return (a, b) if a <= b else (b, a)
 
-    # Read positive edges
+    # positive edges
     with open(pos_filename, "r") as f:
         for line in f:
             parts = line.rstrip("\n").split("\t")
@@ -309,25 +314,33 @@ def load_signed_graph_from_two_TSV_igraph(
             gene_name_map[gene_id1] = gene_name1
             gene_name_map[gene_id2] = gene_name2
 
-    # Read negative edges
+    # negative edges
     with open(neg_filename, "r") as f:
         for line in f:
             parts = line.rstrip("\n").split("\t")
             gene_id1, gene_id2, gene_name1, gene_name2, weight_str = parts[:5]
-            weight = float(weight_str)
+            raw_weight = float(weight_str)
 
-            if weight < neg_threshold:
+            # thresholding is done on magnitude
+            if abs(raw_weight) < neg_threshold:
                 continue
 
+            if neg_weight_mode == "absolute":
+                neg_contribution = -lambda_neg * abs(raw_weight)
+            elif neg_weight_mode == "signed":
+                neg_contribution = lambda_neg * raw_weight
+            else:
+                raise ValueError("neg_weight_mode must be 'absolute' or 'signed'")
+
             key = canonical_pair(gene_id1, gene_id2)
-            edge_weights[key] = edge_weights.get(key, 0.0) - lambda_neg * weight
+            edge_weights[key] = edge_weights.get(key, 0.0) + neg_contribution
 
             gene_ids.add(gene_id1)
             gene_ids.add(gene_id2)
             gene_name_map[gene_id1] = gene_name1
             gene_name_map[gene_id2] = gene_name2
 
-    # Drop exactly-zero edges after cancellation
+    # remove exact zero after cancellation
     edge_weights = {k: w for k, w in edge_weights.items() if w != 0.0}
 
     sorted_gene_ids = sorted(gene_ids)
