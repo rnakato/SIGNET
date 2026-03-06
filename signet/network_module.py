@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
 from matplotlib.lines import Line2D
+import gzip
 
 NodeId = Hashable
 PartitionLike = Union[Mapping[NodeId, int], Sequence[int]]
@@ -195,6 +196,114 @@ def to_networkx_graph(graph: Union[nx.Graph, ig.Graph]) -> nx.Graph:
 
     _raise_unsupported_graph_type(graph)
 
+
+def filter_low_degree_nodes_signed_nx(
+    G_pos: nx.Graph,
+    G_neg: nx.Graph,
+    *,
+    min_degree: int = 2,
+    degree_mode: str = "union",  # "union", "pos", "neg"
+    copy: bool = True,
+):
+    """
+    Remove nodes whose degree < min_degree from signed graphs (NetworkX).
+
+    Degree can be computed on:
+      - "union": edges from either pos/neg (recommended)
+      - "pos":   pos only
+      - "neg":   neg only
+
+    Returns
+    -------
+    (G_pos_f, G_neg_f)
+    """
+    if degree_mode == "pos":
+        deg = dict(G_pos.degree())
+        nodes_all = set(G_pos.nodes()) | set(G_neg.nodes())
+        # nodes absent from G_pos have degree 0
+        for n in nodes_all:
+            deg.setdefault(n, 0)
+
+    elif degree_mode == "neg":
+        deg = dict(G_neg.degree())
+        nodes_all = set(G_pos.nodes()) | set(G_neg.nodes())
+        for n in nodes_all:
+            deg.setdefault(n, 0)
+
+    elif degree_mode == "union":
+        # union graph for degree computation
+        Gu = nx.Graph()
+        Gu.add_nodes_from(G_pos.nodes(data=True))
+        Gu.add_nodes_from(G_neg.nodes(data=True))
+        Gu.add_edges_from(G_pos.edges())
+        Gu.add_edges_from(G_neg.edges())
+        deg = dict(Gu.degree())
+
+    else:
+        raise ValueError("degree_mode must be one of: union, pos, neg")
+
+    keep_nodes = {n for n, d in deg.items() if d >= min_degree}
+
+    if copy:
+        G_pos_f = G_pos.subgraph(keep_nodes).copy()
+        G_neg_f = G_neg.subgraph(keep_nodes).copy()
+    else:
+        # view
+        G_pos_f = G_pos.subgraph(keep_nodes)
+        G_neg_f = G_neg.subgraph(keep_nodes)
+
+    return G_pos_f, G_neg_f
+
+import igraph as ig
+
+def filter_low_degree_nodes_signed_igraph(
+    G_pos: ig.Graph,
+    G_neg: ig.Graph,
+    *,
+    min_degree: int = 2,
+    degree_mode: str = "union",  # "union", "pos", "neg"
+):
+    """
+    Remove nodes whose degree < min_degree.
+    Degree can be computed on union(pos,neg), pos only, or neg only.
+
+    Returns
+    -------
+    (G_pos_f, G_neg_f) : filtered graphs with reindexed vertices.
+    """
+    if G_pos.vcount() != G_neg.vcount():
+        raise ValueError("G_pos and G_neg must have the same number of vertices.")
+
+    n = G_pos.vcount()
+
+    if degree_mode == "pos":
+        deg = G_pos.degree()
+    elif degree_mode == "neg":
+        deg = G_neg.degree()
+    elif degree_mode == "union":
+        # degree on union graph (treat an edge present in either as an edge)
+        union_edges = set(tuple(sorted(e.tuple)) for e in G_pos.es) | set(tuple(sorted(e.tuple)) for e in G_neg.es)
+        Gu = ig.Graph(n=n, edges=list(union_edges), directed=False)
+        deg = Gu.degree()
+    else:
+        raise ValueError("degree_mode must be one of: union, pos, neg")
+
+    keep = [i for i, d in enumerate(deg) if d >= min_degree]
+    if len(keep) == n:
+        return G_pos, G_neg
+
+    G_pos_f = G_pos.induced_subgraph(keep)
+    G_neg_f = G_neg.induced_subgraph(keep)
+
+    # keep vertex attrs consistent
+    for attr in set(G_pos.vs.attributes()) | set(G_neg.vs.attributes()):
+        if attr in G_pos.vs.attributes() and attr not in G_pos_f.vs.attributes():
+            G_pos_f.vs[attr] = [G_pos.vs[i][attr] for i in keep]
+        if attr in G_neg.vs.attributes() and attr not in G_neg_f.vs.attributes():
+            G_neg_f.vs[attr] = [G_neg.vs[i][attr] for i in keep]
+
+    return G_pos_f, G_neg_f
+
 # =============================================================================
 # File loaders
 # =============================================================================
@@ -267,6 +376,302 @@ def load_graph_from_TSV_igraph(filename: str, threshold: float) -> ig.Graph:
 
     return graph
 
+
+def load_snap_signed_tsv_nx(
+    path,
+    *,
+    undirected=True,
+    conflict="both",          # "both", "sum", "prefer_pos", "prefer_neg"
+    add_weights=True,
+    keep_self_loops=False,
+    # optional filtering
+    min_degree=None,
+    degree_mode="union",      # "union", "pos", "neg"
+):
+    """
+    Load SNAP signed TSV (FromNodeId, ToNodeId, Sign) into two NetworkX graphs:
+    positive graph and negative graph.
+
+    If undirected=True, canonicalize edges as (min(u,v), max(u,v)).
+    For conflicting signs on the same undirected pair, use `conflict`.
+
+    Edge weight (if add_weights=True):
+      - conflict="both": weight = count of that sign
+      - conflict="sum":  weight = abs(net_sign_sum)
+      - prefer_*:        weight = count of kept sign
+    """
+    opener = gzip.open if str(path).endswith(".gz") else open
+    mode = "rt" if str(path).endswith(".gz") else "r"
+
+    # counts[(u,v)] = [pos_count, neg_count]
+    counts = {}
+
+    def canonical_pair(a, b):
+        return (a, b) if a <= b else (b, a)
+
+    with opener(path, mode) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+
+            u = int(parts[0]); v = int(parts[1]); s = int(parts[2])
+
+            if not keep_self_loops and u == v:
+                continue
+
+            if undirected and u != v:
+                a, b = canonical_pair(u, v)
+            else:
+                a, b = u, v
+
+            key = (a, b)
+            if key not in counts:
+                counts[key] = [0, 0]
+
+            if s > 0:
+                counts[key][0] += 1
+            else:
+                counts[key][1] += 1
+
+    G_pos = nx.Graph()
+    G_neg = nx.Graph()
+
+    # add nodes (union)
+    nodes = set()
+    for (u, v) in counts.keys():
+        nodes.add(u); nodes.add(v)
+    for n in nodes:
+        # store original id as string-like attributes for compatibility
+        G_pos.add_node(n, gene_id=str(n), name=str(n))
+        G_neg.add_node(n, gene_id=str(n), name=str(n))
+
+    # add edges
+    for (u, v), (pc, nc) in counts.items():
+        if conflict == "both":
+            if pc > 0:
+                if add_weights:
+                    G_pos.add_edge(u, v, weight=float(pc))
+                else:
+                    G_pos.add_edge(u, v)
+            if nc > 0:
+                if add_weights:
+                    G_neg.add_edge(u, v, weight=float(nc))
+                else:
+                    G_neg.add_edge(u, v)
+
+        elif conflict == "sum":
+            net = pc - nc
+            if net > 0:
+                if add_weights:
+                    G_pos.add_edge(u, v, weight=float(abs(net)))
+                else:
+                    G_pos.add_edge(u, v)
+            elif net < 0:
+                if add_weights:
+                    G_neg.add_edge(u, v, weight=float(abs(net)))
+                else:
+                    G_neg.add_edge(u, v)
+
+        elif conflict == "prefer_pos":
+            if pc > 0:
+                if add_weights:
+                    G_pos.add_edge(u, v, weight=float(pc))
+                else:
+                    G_pos.add_edge(u, v)
+            elif nc > 0:
+                if add_weights:
+                    G_neg.add_edge(u, v, weight=float(nc))
+                else:
+                    G_neg.add_edge(u, v)
+
+        elif conflict == "prefer_neg":
+            if nc > 0:
+                if add_weights:
+                    G_neg.add_edge(u, v, weight=float(nc))
+                else:
+                    G_neg.add_edge(u, v)
+            elif pc > 0:
+                if add_weights:
+                    G_pos.add_edge(u, v, weight=float(pc))
+                else:
+                    G_pos.add_edge(u, v)
+
+        else:
+            raise ValueError("conflict must be one of: both, sum, prefer_pos, prefer_neg")
+
+    # optional low-degree filter
+    if min_degree is not None:
+        G_pos, G_neg = filter_low_degree_nodes_signed_nx(
+            G_pos, G_neg,
+            min_degree=int(min_degree),
+            degree_mode=degree_mode,
+            copy=True,
+        )
+
+    return G_pos, G_neg
+
+def load_snap_signed_tsv_igraph(
+    path,
+    *,
+    undirected=True,
+    conflict="both",          # "both", "sum", "prefer_pos", "prefer_neg"
+    add_weights=True,         # True: edge weight = count (or |sum| for conflict="sum")
+    keep_self_loops=False,
+    min_degree=None,          # e.g. 2 to remove degree<=1
+    degree_mode="union",      # "union", "pos", "neg"
+):
+    """
+    Load SNAP signed TSV (FromNodeId, ToNodeId, Sign) into two igraph.Graph objects:
+    positive graph and negative graph.
+
+    The original file is directed; set undirected=True to treat edges as undirected.
+
+    Parameters
+    ----------
+    path : str
+        Path to soc-sign-epinions.txt or .txt.gz
+    undirected : bool
+        If True, canonicalize edge (min(u,v), max(u,v)).
+    conflict : str
+        How to resolve both + and - observed for the same undirected pair.
+        - "both": put the pair into both graphs (weights count occurrences)
+        - "sum":  aggregate sign; positive sum -> pos, negative sum -> neg, zero -> drop
+        - "prefer_pos": if both appear, keep only pos
+        - "prefer_neg": if both appear, keep only neg
+    add_weights : bool
+        If True, set edge weights.
+        - conflict="both": weight = count of that sign for the pair
+        - conflict="sum":  weight = abs(net_sign_sum)
+        - prefer_*:        weight = count of kept sign
+    keep_self_loops : bool
+        If False, discard u==v edges.
+    """
+    # open file (gz or plain)
+    opener = gzip.open if str(path).endswith(".gz") else open
+    mode = "rt" if str(path).endswith(".gz") else "r"
+
+    # accumulate per undirected pair:
+    # counts[(u,v)] = [pos_count, neg_count]  (u<v)
+    counts = {}
+
+    nodes = set()
+
+    with opener(path, mode) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+
+            u = int(parts[0]); v = int(parts[1]); s = int(parts[2])
+            if not keep_self_loops and u == v:
+                continue
+
+            nodes.add(u); nodes.add(v)
+
+            if undirected and u != v:
+                a, b = (u, v) if u < v else (v, u)
+            else:
+                a, b = u, v
+
+            key = (a, b)
+            if key not in counts:
+                counts[key] = [0, 0]
+
+            if s > 0:
+                counts[key][0] += 1
+            else:
+                counts[key][1] += 1
+
+    # map node ids to contiguous vertex indices
+    node_list = sorted(nodes)
+    id2idx = {nid: i for i, nid in enumerate(node_list)}
+
+    pos_edges = []
+    pos_w = []
+    neg_edges = []
+    neg_w = []
+
+    for (a, b), (pc, nc) in counts.items():
+        if not undirected and a == b and not keep_self_loops:
+            continue
+
+        ia = id2idx[a]; ib = id2idx[b]
+
+        if conflict == "both":
+            if pc > 0:
+                pos_edges.append((ia, ib))
+                if add_weights:
+                    pos_w.append(float(pc))
+            if nc > 0:
+                neg_edges.append((ia, ib))
+                if add_weights:
+                    neg_w.append(float(nc))
+
+        elif conflict == "sum":
+            net = pc - nc
+            if net > 0:
+                pos_edges.append((ia, ib))
+                if add_weights:
+                    pos_w.append(float(abs(net)))
+            elif net < 0:
+                neg_edges.append((ia, ib))
+                if add_weights:
+                    neg_w.append(float(abs(net)))
+            # net == 0 -> drop
+
+        elif conflict == "prefer_pos":
+            if pc > 0:
+                pos_edges.append((ia, ib))
+                if add_weights:
+                    pos_w.append(float(pc))
+            elif nc > 0:
+                neg_edges.append((ia, ib))
+                if add_weights:
+                    neg_w.append(float(nc))
+
+        elif conflict == "prefer_neg":
+            if nc > 0:
+                neg_edges.append((ia, ib))
+                if add_weights:
+                    neg_w.append(float(nc))
+            elif pc > 0:
+                pos_edges.append((ia, ib))
+                if add_weights:
+                    pos_w.append(float(pc))
+
+        else:
+            raise ValueError("conflict must be one of: both, sum, prefer_pos, prefer_neg")
+
+    G_pos = ig.Graph(n=len(node_list), edges=pos_edges, directed=False)
+    G_neg = ig.Graph(n=len(node_list), edges=neg_edges, directed=False)
+
+    # store original node ids
+    G_pos.vs["gene_id"] = [str(n) for n in node_list]
+    G_pos.vs["name"] = [str(n) for n in node_list]
+    G_neg.vs["gene_id"] = [str(n) for n in node_list]
+    G_neg.vs["name"] = [str(n) for n in node_list]
+
+    if add_weights:
+        if len(pos_edges) > 0:
+            G_pos.es["weight"] = pos_w
+        if len(neg_edges) > 0:
+            G_neg.es["weight"] = neg_w
+
+    if min_degree is not None:
+        G_pos, G_neg = filter_low_degree_nodes_signed_igraph(
+            G_pos, G_neg,
+            min_degree=int(min_degree),
+            degree_mode=degree_mode,
+        )
+
+    return G_pos, G_neg
 
 def load_signed_graph_from_two_TSV_igraph(
     pos_filename,
