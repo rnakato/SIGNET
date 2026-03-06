@@ -16,7 +16,6 @@ def renumber(dictionary):
     renumbering = dict(zip(values, range(len(values))))
     return {k: renumbering[v] for k, v in dictionary.items()}
 
-
 class GraphInfo:
     def __init__(self, ref_graph, graph, partition, weight_key):
         self.graph_whole = nx.Graph()
@@ -64,12 +63,12 @@ class GraphInfo:
 
     def _remove_node(self, node, partition, linksum_dict):
         community = partition.get(node)
-        linksum = self.linksum_dict[node].get(community, 0.)
+        linksum = linksum_dict.get(community, 0.)
         self.community_degrees[community] = self.community_degrees.get(community, 0.) - self.node_degrees.get(node, 0.)
         self.community_sizes[community] = self.community_sizes.get(community, 0.) - linksum - self.loops.get(node, 0.)
 
     def _insert_node(self, node, partition, linksum_dict, community):
-        linksum = self.linksum_dict[node].get(community, 0.)
+        linksum = linksum_dict.get(community, 0.)
         partition[node] = community
         self.community_degrees[community] = self.community_degrees.get(community, 0.) + self.node_degrees.get(node, 0.)
         self.community_sizes[community] = self.community_sizes.get(community, 0.) + linksum + self.loops.get(node, 0.)
