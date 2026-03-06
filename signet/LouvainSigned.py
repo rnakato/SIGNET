@@ -17,75 +17,6 @@ def renumber(dictionary):
     return {k: renumbering[v] for k, v in dictionary.items()}
 
 
-def plot_alphas_distributions(G_positive, G_negative, resolution, seed):
-
-    alphas = np.arange(0, 1.05, 0.05)
-    intra_pos_ratios = []
-    inter_pos_ratios = []
-    intra_neg_ratios = []
-    inter_neg_ratios = []
-    entropies = []
-    n_communities_list = []
-
-    for alpha in alphas:
-        partition = LouvainSigned(G_positive, G_negative).best_partition(alpha=alpha, resolution=resolution, seed=seed)
-
-        communities = set(partition.values())
-        n_communities = len(communities)
-        entropy = calc_entropy(partition)
-
-        intra_pos_edges, inter_pos_edges, intra_neg_edges, inter_neg_edges = 0, 0, 0, 0
-        for u, v in G_positive.edges():
-            if partition[u] == partition[v]:
-                intra_pos_edges += 1
-            else:
-                inter_pos_edges += 1
-        for u, v in G_negative.edges():
-            if u not in partition or v not in partition:
-                continue
-            if partition[u] == partition[v]:
-                intra_neg_edges += 1
-            else:
-                inter_neg_edges += 1
-
-        total_pos_edges = G_positive.number_of_edges()
-        total_neg_edges = G_negative.number_of_edges()
-
-        intra_pos_ratio = intra_pos_edges / total_pos_edges
-        inter_pos_ratio = inter_pos_edges / total_pos_edges
-        intra_neg_ratio = intra_neg_edges / total_neg_edges
-        inter_neg_ratio = inter_neg_edges / total_neg_edges
-
-        # Append the results to the lists
-        intra_pos_ratios.append(intra_pos_ratio)
-        inter_pos_ratios.append(inter_pos_ratio)
-        intra_neg_ratios.append(intra_neg_ratio)
-        inter_neg_ratios.append(inter_neg_ratio)
-        n_communities_list.append(n_communities)
-        entropies.append(entropy)
-
-    fig, ax1 = plt.subplots(figsize=(10, 6))
-    ax1.plot(alphas, intra_pos_ratios, label='Intra-community Positive Ratio')
-    ax1.plot(alphas, inter_pos_ratios, label='Inter-community Positive Ratio')
-    ax1.plot(alphas, intra_neg_ratios, label='Intra-community Negative Ratio')
-    ax1.plot(alphas, inter_neg_ratios, label='Inter-community Negative Ratio')
-    ax1.plot(alphas, entropies,        label='Normalized entropy')
-    ax1.set_xlabel('Alpha')
-    ax1.set_ylabel('Ratio')
-    ax1.legend(loc='upper left')
-    ax1.grid(True)
-
-    ax2 = ax1.twinx()
-    ax1.invert_xaxis()
-    # Plot the number of communities with the second y-axis
-    ax2.bar(alphas, n_communities_list, width=0.03, alpha=0.6, color='gray', label='Number of Communities')
-    ax2.set_ylabel('Number of Communities')
-
-    # Add the legend for the second y-axis
-    ax2.legend(loc='upper right')
-
-    #plt.show()
-
 class GraphInfo:
     def __init__(self, ref_graph, graph, partition, weight_key):
         self.graph_whole = nx.Graph()
@@ -175,9 +106,9 @@ class GraphInfo:
 
 
 class LouvainSigned:
-    def __init__(self, positive_graph, negative_graph, *, mode="positive"):
+    def __init__(self, positive_graph, negative_graph):
         self.weight_key = 'weight'
-        self.graph_whole = self.get_signed_graph(positive_graph, negative_graph, mode)
+        self.graph_whole = self.get_signed_graph(positive_graph, negative_graph)
         self.graph_original = self.graph_whole.copy()
 
         self.partition = {node: i for i, node in enumerate(self.graph_whole.nodes())}
@@ -186,17 +117,13 @@ class LouvainSigned:
         self.ginfo_neg = GraphInfo(self.graph_whole, negative_graph, self.partition, self.weight_key)
 
         self.dendrogram = list()
-        self.mode = mode
 
-    def get_signed_graph(self, positive_graph, negative_graph, mode):
+    def get_signed_graph(self, positive_graph, negative_graph):
         graph = nx.Graph()
-        if mode == "Full":
-            graph.add_nodes_from(positive_graph.nodes(data=True))
-            graph.add_nodes_from(negative_graph.nodes(data=True))
-            # graph.add_edges_from(positive_graph.edges(data=True), sign='positive')
-            # graph.add_edges_from(negative_graph.edges(data=True), sign='negative')
-        else:
-            graph.add_nodes_from(positive_graph.nodes(data=True))
+
+        # Union of nodes (preserve attributes; negative may add missing attrs)
+        graph.add_nodes_from(positive_graph.nodes(data=True))
+        graph.add_nodes_from(negative_graph.nodes(data=True))
 
         return graph
 
@@ -245,7 +172,7 @@ class LouvainSigned:
                     best_community = original_community
                     best_increase = 0
 
-                    neighbor_communities = set(linksum_dict_pos.keys())
+                    neighbor_communities = set(linksum_dict_pos.keys()) | set(linksum_dict_neg.keys())
 
                     for neighboring_community in self._randomize(neighbor_communities, random_generator):
                         q2_pos = self.ginfo_pos._delta_q_2(node, linksum_dict_pos, neighboring_community, resolution)
@@ -291,7 +218,7 @@ class LouvainSigned:
             aggregated_graph.add_edge(c1, c2, **{weight: w_prec + edge_weight})
         return aggregated_graph
 
-    def generate_dendrogram(self, mode, random_generator, *, alpha=1., resolution=1.):
+    def generate_dendrogram(self, random_generator, *, alpha=1., resolution=1.):
         current_graph_pos = self.ginfo_pos.graph_whole.copy()
         current_graph_neg = self.ginfo_neg.graph_whole.copy()
         partition_list = list()
@@ -303,7 +230,7 @@ class LouvainSigned:
             partition_list.append(renumbered_partition)
             current_graph_pos = self._aggregate_nodes(renumbered_partition, current_graph_pos)
             current_graph_neg = self._aggregate_nodes(renumbered_partition, current_graph_neg)
-            self.graph_whole = self.get_signed_graph(current_graph_pos, current_graph_neg, mode)
+            self.graph_whole = self.get_signed_graph(current_graph_pos, current_graph_neg)
 
             self.partition = {node: i for i, node in enumerate(self.graph_whole.nodes())}
             self.ginfo_pos = GraphInfo(self.graph_whole, current_graph_pos, self.partition, self.weight_key)
@@ -325,7 +252,7 @@ class LouvainSigned:
             return
         print (f"alpha: {alpha}, resolution: {resolution}")
 
-        self.generate_dendrogram(self.mode, np.random.default_rng(seed=seed), alpha=alpha, resolution=resolution)
+        self.generate_dendrogram(np.random.default_rng(seed=seed), alpha=alpha, resolution=resolution)
         partition = self.dendrogram[0].copy()
         for level in range(1, len(self.dendrogram)):
             for node, community in partition.items():
@@ -352,35 +279,3 @@ class LouvainSigned:
             else:
                 results[gene_name] = community_id
         return results
-
-
-def main():
-    parser = argparse.ArgumentParser(prog='eeispcommunity')
-    parser.add_argument("--alpha", help="alpha parameter (from 0 to 1, default: 0.5)", type=float, default=0.5)
-    parser.add_argument("--resolution", help="resolution for louvain (default: 1.0)", type=float, default=1.)
-    parser.add_argument("--seed", help="seed for LouvainSigned", type=int, default=10)
-
-    args = parser.parse_args()
-    print(args)
-
-    alpha = args.alpha
-    community_size = 8
-    num_communities = 4
-    intra_edges = 12
-    inter_edges = 10
-    p1 = 0.05
-    p2 = 0.05
-
-    G_positive, G_negative = generate_signednetwork(community_size, num_communities, intra_edges, inter_edges, p1, p2)
-
-    print(f"G_positive: Nodes={G_positive.number_of_nodes()}, Edges={G_positive.number_of_edges()}")
-    print(f"G_negative: Nodes={G_negative.number_of_nodes()}, Edges={G_negative.number_of_edges()}")
-    print(f"G: Nodes={nx.compose(G_positive, G_negative).number_of_nodes()}, Edges={nx.compose(G_positive, G_negative).number_of_edges()}")
-
-    l = LouvainSigned(G_positive, G_negative, alpha, seed=args.seed)
-    partition = l.best_partition()
-    print(f"partition: {partition}")
-
-
-if __name__ == "__main__":
-    main()

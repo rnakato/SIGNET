@@ -192,20 +192,25 @@ def _find_partition_signed_modularity_core(
         name_attr=name_attr,
     )
 
-    part_pos = la.find_partition(
+    n = aligned_G_pos.vcount()
+    if aligned_G_neg.vcount() != n:
+        raise ValueError("Aligned positive/negative graphs have different number of vertices.")
+
+    # multiplex では、両 layer で同じ initial_membership を使うのが安全
+    initial_membership = list(range(n))
+
+    part_pos = la.RBConfigurationVertexPartition(
         aligned_G_pos,
-        la.RBConfigurationVertexPartition,
         weights="weight" if "weight" in aligned_G_pos.es.attributes() else None,
         resolution_parameter=resolution,
-        seed=seed,
+        initial_membership=initial_membership,
     )
 
-    part_neg = la.find_partition(
+    part_neg = la.RBConfigurationVertexPartition(
         aligned_G_neg,
-        la.RBConfigurationVertexPartition,
         weights="weight" if "weight" in aligned_G_neg.es.attributes() else None,
         resolution_parameter=resolution,
-        seed=seed,
+        initial_membership=initial_membership,
     )
 
     optimiser = la.Optimiser()

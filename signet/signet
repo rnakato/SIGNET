@@ -6,42 +6,410 @@ Copyright(c)  Ryuichiro Nakato <rnakato@iqb.u-tokyo.ac.jp>
 All rights reserved.
 '''
 
-import numpy as np
-import networkx as nx
+"""
+signet CLI (TSV / Epinions) + (LouvainSigned / Leiden modularity / Leiden CPM)
+
+Examples
+--------
+# TSV (positive+negative), Leiden modularity (alpha)
+python signet.py run --input tsv --pos data/hsc_CDI_score_data_thre10.txt --neg data/hsc_EEI_score_data_thre5.txt \
+  --thre-pos 10 --thre-neg 5 --method leiden-mod-alpha --alpha 0.6 --resolution 1.0 --seed 12345 --out partition.tsv
+
+# TSV, Leiden modularity (lambda_neg)
+python signet.py run --input tsv --pos ... --neg ... --method leiden-mod-lambda --lambda-neg 0.7 --resolution 1.0
+
+# TSV, single signed CPM (recommended for CPM)
+python signet.py run --input tsv --pos ... --neg ... --method leiden-cpm-single --lambda-neg 1.0 --gamma 0.5
+
+# Epinions MAT, Leiden modularity (alpha)
+python signet.py run --input epinions --mat data/epinions_data.mat --method leiden-mod-alpha --alpha 0.6 --resolution 1.0
+
+# Epinions MAT, single signed CPM
+python signet.py run --input epinions --mat data/epinions_data.mat --method leiden-cpm-single --lambda-neg 1.0 --gamma 0.5
+"""
+
 import argparse
+import sys
+from pathlib import Path
 
-ITER_LIMIT_PER_LOCALMOVE = -1
-MIN = 0.0000001
+import numpy as np
 
-def main():
-    parser = argparse.ArgumentParser(prog='signet')
-    parser.add_argument("CDI_score_data", help="CDI_score_data", type=str)
-    parser.add_argument("EEI_score_data", help="Output EEI_score_data", type=str)
-    parser.add_argument("--thre_CDI", help="Threshold of CDI (default: 10)", type=int, default=10)
-    parser.add_argument("--thre_EEI", help="Threshold of EEI (default: 5)", type=int, default=5)
-    parser.add_argument("--alpha", help="alpha parameter (from 0 to 1, default: 0.5)", type=float, default=0.5)
-    parser.add_argument("--resolution", help="resolution for louvain (default: 1.0)", type=float, default=1.)
-    parser.add_argument("--seed", help="seed for LouvainSigned", type=int)
-    parser.add_argument("-v", "--version", action='version', version='%(prog)s 0.6.0')
+# Optional imports depending on method/input
+import igraph as ig
 
-    args = parser.parse_args()
-    print(args)
+# Your package modules (adjust names if needed)
+import signet.network_module as nr
+import signet.LeidenSigned as les
 
-    alpha = args.alpha
-    seed = args.seed
-    resolution = args.resolution
+# LouvainSigned is assumed to be available (your earlier usage)
+# If it is in signet.LouvainSigned, change import accordingly.
+try:
+    from signet.LouvainSigned import LouvainSigned
+except Exception:
+    LouvainSigned = None
 
-    G_positive = load_graph_from_file(args.CDI_score_data, args.thre_CDI)
-    G_negative = load_graph_from_file(args.EEI_score_data, args.thre_EEI)
 
-    print(f"G_positive: Nodes={G_positive.number_of_nodes()}, Edges={G_positive.number_of_edges()}")
-    print(f"G_negative: Nodes={G_negative.number_of_nodes()}, Edges={G_negative.number_of_edges()}")
-    print(f"G: Nodes={nx.compose(G_positive, G_negative).number_of_nodes()}, Edges={nx.compose(G_positive, G_negative).number_of_edges()}")
+# =============================================================================
+# IO helpers
+# =============================================================================
 
-    l = LouvainSigned(G_positive, G_negative)
-    partition = l.best_partition(alpha=alpha, resolution=resolution, seed=seed)
-    print(f"partition: {partition}")
+def load_input_graphs(args):
+    """
+    Return (G_pos, G_neg, meta) where:
+      - G_pos, G_neg are either igraph.Graph or networkx.Graph depending on method,
+      - meta includes gene_id/name availability.
+    """
+    meta = {}
+
+    if args.input == "tsv":
+        pos_path = Path(args.pos)
+        neg_path = Path(args.neg)
+        if not pos_path.exists():
+            raise FileNotFoundError(f"Positive TSV not found: {pos_path}")
+        if not neg_path.exists():
+            raise FileNotFoundError(f"Negative TSV not found: {neg_path}")
+
+        # For Leiden methods, prefer igraph
+        if args.method.startswith("leiden"):
+            G_pos = nr.load_graph_from_EEISP_igraph(str(pos_path), threshold=float(args.thre_pos))
+            G_neg = nr.load_graph_from_EEISP_igraph(str(neg_path), threshold=float(args.thre_neg))
+            meta["has_gene_id"] = "gene_id" in G_pos.vs.attributes()
+            meta["has_name"] = "name" in G_pos.vs.attributes()
+            meta["source"] = "tsv"
+            meta["pos_path"] = str(pos_path)
+            meta["neg_path"] = str(neg_path)
+            return G_pos, G_neg, meta
+
+        # LouvainSigned (networkx expected)
+        if args.method == "louvain":
+            if LouvainSigned is None:
+                raise ImportError("LouvainSigned is not importable. Check signet.LouvainSigned.")
+            G_pos = nr.load_graph_from_EEISP(str(pos_path), threshold=float(args.thre_pos))
+            G_neg = nr.load_graph_from_EEISP(str(neg_path), threshold=float(args.thre_neg))
+            meta["source"] = "tsv"
+            meta["pos_path"] = str(pos_path)
+            meta["neg_path"] = str(neg_path)
+            return G_pos, G_neg, meta
+
+        raise ValueError(f"Unsupported method for TSV: {args.method}")
+
+    if args.input == "epinions":
+        # Load MAT -> sparse matrices -> igraph graphs
+        from scipy.io import loadmat
+        import scipy.sparse as sp
+
+        mat_path = Path(args.mat)
+        if not mat_path.exists():
+            raise FileNotFoundError(f"MAT not found: {mat_path}")
+
+        data = loadmat(str(mat_path))
+        if args.pos_key not in data or args.neg_key not in data:
+            raise KeyError(f"Keys not found in MAT: need '{args.pos_key}' and '{args.neg_key}'")
+
+        pos_matrix = sp.csr_matrix(data[args.pos_key])
+        neg_matrix = sp.csr_matrix(data[args.neg_key])
+
+        # IMPORTANT: do not densify
+        pos_matrix.setdiag(0); pos_matrix.eliminate_zeros()
+        neg_matrix.setdiag(0); neg_matrix.eliminate_zeros()
+
+        G_pos = ig.Graph.Weighted_Adjacency(pos_matrix, mode="undirected", attr="weight", loops="ignore")
+        G_neg = ig.Graph.Weighted_Adjacency(neg_matrix, mode="undirected", attr="weight", loops="ignore")
+
+        # Epinions may not have names; create stable ids
+        n = G_pos.vcount()
+        if G_neg.vcount() != n:
+            raise ValueError("Epinions pos/neg matrices must have same shape.")
+
+        G_pos.vs["gene_id"] = [str(i) for i in range(n)]
+        G_pos.vs["name"] = [str(i) for i in range(n)]
+        G_neg.vs["gene_id"] = [str(i) for i in range(n)]
+        G_neg.vs["name"] = [str(i) for i in range(n)]
+
+        meta["source"] = "epinions"
+        meta["mat_path"] = str(mat_path)
+        meta["pos_key"] = args.pos_key
+        meta["neg_key"] = args.neg_key
+        meta["has_gene_id"] = True
+        meta["has_name"] = True
+        return G_pos, G_neg, meta
+
+    raise ValueError(f"Unknown input type: {args.input}")
+
+
+def write_partition_tsv(out_path, gene_ids, membership):
+    out_path = Path(out_path)
+    with out_path.open("w", encoding="utf-8") as f:
+        f.write("gene_id\tcommunity\n")
+        for gid, c in zip(gene_ids, membership):
+            f.write(f"{gid}\t{c}\n")
+
+
+def summarise_partition(membership):
+    n_nodes = len(membership)
+    n_comms = len(set(membership))
+    sizes = sorted([v for v in dict((k, membership.count(k)) for k in set(membership)).values()], reverse=True)
+    return {
+        "n_nodes": n_nodes,
+        "n_communities": n_comms,
+        "largest_community": sizes[0] if sizes else 0,
+    }
+
+
+# =============================================================================
+# Method runners
+# =============================================================================
+
+def run_louvain_signed(G_pos, G_neg, args):
+    # networkx-based, returns dict node->comm
+    l = LouvainSigned(G_pos, G_neg)
+    part = l.best_partition(alpha=float(args.alpha), resolution=float(args.resolution), seed=args.seed)
+    return part
+
+
+def run_leiden_modularity_alpha(G_pos, G_neg, args):
+    part = les.find_partition_signed_modularity_alpha(
+        G_pos, G_neg,
+        resolution=float(args.resolution),
+        alpha=float(args.alpha),
+        seed=args.seed,
+    )
+    return part
+
+
+def run_leiden_modularity_lambda(G_pos, G_neg, args):
+    part = les.find_partition_signed_modularity_lambda(
+        G_pos, G_neg,
+        resolution=float(args.resolution),
+        lambda_neg=float(args.lambda_neg),
+        seed=args.seed,
+    )
+    return part
+
+
+def run_leiden_cpm_single_signed(G_pos, G_neg, args):
+    # Build a single signed graph from two graphs (already igraph) without TSV re-read.
+    # signed_weight = w_pos - lambda_neg * w_neg
+    lambda_neg = float(args.lambda_neg)
+
+    # Build signed sparse adjacency by edge dict (works for moderate size; Epinions may be large)
+    # For large Epinions, prefer matrix form; but we still support it here using adjacency matrices if requested.
+    if args.input == "epinions":
+        # Use adjacency matrices directly (efficient)
+        import scipy.sparse as sp
+        Apos = G_pos.get_adjacency_sparse(attribute="weight")
+        Aneg = G_neg.get_adjacency_sparse(attribute="weight")
+        if args.neg_weight_mode == "absolute":
+            Asigned = Apos - lambda_neg * Aneg
+        else:
+            Asigned = Apos + lambda_neg * Aneg
+        Asigned = Asigned.tocsr()
+        Asigned.setdiag(0); Asigned.eliminate_zeros()
+        G_signed = ig.Graph.Weighted_Adjacency(Asigned, mode="undirected", attr="weight", loops="ignore")
+        G_signed.vs["gene_id"] = list(G_pos.vs["gene_id"])
+        G_signed.vs["name"] = list(G_pos.vs["name"])
+    else:
+        # TSV case (igraph with gene_id/name) -> edge dict
+        edge_w = {}
+
+        def add_edge(u, v, w):
+            a, b = (u, v) if u < v else (v, u)
+            edge_w[(a, b)] = edge_w.get((a, b), 0.0) + w
+
+        # positive
+        for e in G_pos.es:
+            u, v = e.tuple
+            w = float(e["weight"]) if "weight" in G_pos.es.attributes() else 1.0
+            add_edge(u, v, w)
+
+        # negative
+        for e in G_neg.es:
+            u, v = e.tuple
+            wraw = float(e["weight"]) if "weight" in G_neg.es.attributes() else 1.0
+            if args.neg_weight_mode == "absolute":
+                w = -lambda_neg * abs(wraw)
+            else:
+                w = lambda_neg * wraw
+            add_edge(u, v, w)
+
+        # build signed graph
+        n = G_pos.vcount()
+        edges = list(edge_w.keys())
+        weights = [edge_w[k] for k in edges]
+        # remove exact zeros
+        edges2, weights2 = [], []
+        for (u, v), w in zip(edges, weights):
+            if w != 0.0:
+                edges2.append((u, v))
+                weights2.append(w)
+
+        G_signed = ig.Graph(n=n, edges=edges2, directed=False)
+        G_signed.es["weight"] = weights2
+        # carry attrs
+        if "gene_id" in G_pos.vs.attributes():
+            G_signed.vs["gene_id"] = list(G_pos.vs["gene_id"])
+        if "name" in G_pos.vs.attributes():
+            G_signed.vs["name"] = list(G_pos.vs["name"])
+
+    # Run CPM once
+    part = les.find_partition_signed_CPM_single_graph(
+        G_signed,
+        gamma=float(args.gamma),
+        seed=args.seed,
+    )
+    return part
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="signet")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    run = sub.add_parser("run", help="Run signed community detection")
+    run.add_argument("--input", choices=["tsv", "epinions"], required=True,
+                     help="Input type: 'tsv' (pos/neg TSV) or 'epinions' (MAT with pos/neg sparse matrices)")
+
+    # TSV args
+    run.add_argument("--pos", type=str, help="Positive TSV file (CDI etc.)")
+    run.add_argument("--neg", type=str, help="Negative TSV file (EEI etc.)")
+    run.add_argument("--thre-pos", type=float, default=10.0, help="Threshold for positive TSV (default: 10)")
+    run.add_argument("--thre-neg", type=float, default=5.0, help="Threshold for negative TSV (default: 5)")
+
+    # Epinions args
+    run.add_argument("--mat", type=str, help="MAT file path (e.g., epinions_data.mat)")
+    run.add_argument("--pos-key", type=str, default="pos", help="MAT key for positive matrix (default: pos)")
+    run.add_argument("--neg-key", type=str, default="neg", help="MAT key for negative matrix (default: neg)")
+
+    # Method selection
+    run.add_argument("--method",
+                     choices=[
+                         "louvain",
+                         "leiden-mod-alpha",
+                         "leiden-mod-lambda",
+                         "leiden-cpm-single",
+                     ],
+                     required=True,
+                     help="Method to run")
+
+    # Common params
+    run.add_argument("--seed", type=int, default=None, help="Random seed")
+
+    # Louvain / Leiden modularity params
+    run.add_argument("--resolution", type=float, default=1.0, help="Resolution parameter (default: 1.0)")
+    run.add_argument("--alpha", type=float, default=0.5, help="Alpha in [0,1] (default: 0.5)")
+    run.add_argument("--lambda-neg", type=float, default=0.0, help="lambda_neg >= 0 (default: 0.0)")
+
+    # CPM single signed params
+    run.add_argument("--gamma", type=float, default=0.5, help="CPM gamma (resolution_parameter) (default: 0.5)")
+    run.add_argument("--neg-weight-mode", choices=["absolute", "signed"], default="absolute",
+                     help="How to interpret negative weights when building signed graph (default: absolute)")
+
+    # Output
+    run.add_argument("--out", type=str, default=None, help="Write partition to TSV (gene_id, community)")
+    run.add_argument("--quiet", action="store_true", help="Less printing")
+
+    p.add_argument("-v", "--version", action="version", version="%(prog)s 0.7.0")
+    return p
+
+
+def validate_args(args):
+    if args.command != "run":
+        return
+
+    if args.input == "tsv":
+        if not args.pos or not args.neg:
+            raise ValueError("--pos and --neg are required when --input tsv")
+    if args.input == "epinions":
+        if not args.mat:
+            raise ValueError("--mat is required when --input epinions")
+
+    if args.method == "louvain":
+        if args.input != "tsv":
+            raise ValueError("louvain mode currently expects TSV/networkx loader. Use leiden methods for epinions.")
+        if LouvainSigned is None:
+            raise ImportError("LouvainSigned is not available.")
+        if not (0.0 <= args.alpha <= 1.0):
+            raise ValueError("--alpha must be in [0,1] for louvain")
+        return
+
+    if args.method == "leiden-mod-alpha":
+        if not (0.0 <= args.alpha <= 1.0):
+            raise ValueError("--alpha must be in [0,1] for leiden-mod-alpha")
+        return
+
+    if args.method == "leiden-mod-lambda":
+        if args.lambda_neg < 0:
+            raise ValueError("--lambda-neg must be >= 0 for leiden-mod-lambda")
+        return
+
+    if args.method == "leiden-cpm-single":
+        if args.lambda_neg < 0:
+            raise ValueError("--lambda-neg must be >= 0 for leiden-cpm-single")
+        return
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    validate_args(args)
+
+    G_pos, G_neg, meta = load_input_graphs(args)
+
+    if not args.quiet:
+        if hasattr(G_pos, "vcount"):
+            print(f"[INFO] G_pos: v={G_pos.vcount()} e={G_pos.ecount()}")
+            print(f"[INFO] G_neg: v={G_neg.vcount()} e={G_neg.ecount()}")
+        else:
+            print(f"[INFO] G_pos: nodes={G_pos.number_of_nodes()} edges={G_pos.number_of_edges()}")
+            print(f"[INFO] G_neg: nodes={G_neg.number_of_nodes()} edges={G_neg.number_of_edges()}")
+        print(f"[INFO] method={args.method} input={args.input}")
+
+    # Run selected method
+    if args.method == "louvain":
+        partition = run_louvain_signed(G_pos, G_neg, args)
+        # networkx dict: node->community
+        # write out (node IDs as gene_id)
+        if args.out:
+            gene_ids = list(partition.keys())
+            membership = [partition[g] for g in gene_ids]
+            write_partition_tsv(args.out, gene_ids, membership)
+        else:
+            # print summary
+            membership = list(partition.values())
+            print("[RESULT]", summarise_partition(membership))
+        return 0
+
+    if args.method == "leiden-mod-alpha":
+        part = run_leiden_modularity_alpha(G_pos, G_neg, args)
+    elif args.method == "leiden-mod-lambda":
+        part = run_leiden_modularity_lambda(G_pos, G_neg, args)
+    elif args.method == "leiden-cpm-single":
+        part = run_leiden_cpm_single_signed(G_pos, G_neg, args)
+    else:
+        raise ValueError(f"Unknown method: {args.method}")
+
+    membership = list(part.membership)
+    gene_ids = None
+    if hasattr(part, "graph") and "gene_id" in part.graph.vs.attributes():
+        gene_ids = list(part.graph.vs["gene_id"])
+    elif hasattr(G_pos, "vs") and "gene_id" in G_pos.vs.attributes():
+        # CPM single graph may keep attributes from pos graph
+        gene_ids = list(G_pos.vs["gene_id"])
+    else:
+        gene_ids = [str(i) for i in range(len(membership))]
+
+    if args.out:
+        write_partition_tsv(args.out, gene_ids, membership)
+        if not args.quiet:
+            print(f"[INFO] wrote: {args.out}")
+    else:
+        print("[RESULT]", summarise_partition(membership))
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
