@@ -761,78 +761,6 @@ def load_signed_graph_from_two_TSV_igraph(
 
     return g
 
-
-def build_signed_graph_from_igraph(G_pos, G_neg, lambda_neg=1.0, neg_weight_mode="absolute"):
-    if G_pos.vcount() != G_neg.vcount():
-        raise ValueError("G_pos and G_neg must have the same number of vertices.")
-
-    # Use undirected canonical edge keys
-    edge_weights = {}
-
-    def canonical_pair(u, v):
-        return (u, v) if u <= v else (v, u)
-
-    # Add positive edges
-    if "weight" in G_pos.es.attributes():
-        for e in G_pos.es:
-            u, v = e.tuple
-            key = canonical_pair(u, v)
-            edge_weights[key] = edge_weights.get(key, 0.0) + float(e["weight"])
-    else:
-        for e in G_pos.es:
-            u, v = e.tuple
-            key = canonical_pair(u, v)
-            edge_weights[key] = edge_weights.get(key, 0.0) + 1.0
-
-    # Add negative edges
-    if "weight" in G_neg.es.attributes():
-        for e in G_neg.es:
-            u, v = e.tuple
-            raw_weight = float(e["weight"])
-            key = canonical_pair(u, v)
-
-            if neg_weight_mode == "absolute":
-                neg_contribution = -lambda_neg * abs(raw_weight)
-            elif neg_weight_mode == "signed":
-                neg_contribution = lambda_neg * raw_weight
-            else:
-                raise ValueError("neg_weight_mode must be 'absolute' or 'signed'")
-
-            edge_weights[key] = edge_weights.get(key, 0.0) + neg_contribution
-    else:
-        for e in G_neg.es:
-            u, v = e.tuple
-            key = canonical_pair(u, v)
-
-            if neg_weight_mode == "absolute":
-                neg_contribution = -lambda_neg * 1.0
-            elif neg_weight_mode == "signed":
-                neg_contribution = -lambda_neg * 1.0
-            else:
-                raise ValueError("neg_weight_mode must be 'absolute' or 'signed'")
-
-            edge_weights[key] = edge_weights.get(key, 0.0) + neg_contribution
-
-    # Remove exactly-zero edges after cancellation
-    edge_weights = {k: w for k, w in edge_weights.items() if w != 0.0}
-
-    # Build signed graph
-    edge_list = list(edge_weights.keys())
-    weight_list = list(edge_weights.values())
-
-    G_signed = ig.Graph(n=G_pos.vcount(), edges=edge_list, directed=False)
-    G_signed.es["weight"] = weight_list
-
-    # Preserve node attributes if present
-    for attr in set(G_pos.vs.attributes()) | set(G_neg.vs.attributes()):
-        if attr in G_pos.vs.attributes():
-            G_signed.vs[attr] = list(G_pos.vs[attr])
-        elif attr in G_neg.vs.attributes():
-            G_signed.vs[attr] = list(G_neg.vs[attr])
-
-    return G_signed
-
-
 # =============================================================================
 # Community / weight utilities
 # =============================================================================
@@ -978,7 +906,6 @@ def build_attr_to_node_map(graph, key):
             mapping[data[key]] = node
     return mapping
 
-
 def _draw_signed_subgraphs(
     pos_subgraph,
     neg_subgraph,
@@ -988,21 +915,63 @@ def _draw_signed_subgraphs(
     match_attr="gene_id",
     layout="spring",
     layout_seed=10,
-    figsize=(10, 8),
+    figsize=(8, 6),
     node_size=500,
     font_size=10,
     label_top_n=None,
 ):
-    pos_nx = to_networkx_graph(pos_subgraph)
-    neg_nx = to_networkx_graph(neg_subgraph)
+    """
+    Draw positive edges in red and negative edges in blue.
+
+    Nodes from pos/neg graphs are merged by `match_attr` (e.g. gene_id),
+    not by raw node ID. This avoids duplicated labels when pos/neg graphs
+    use different internal node indices.
+    """
+    pos_nx_raw = to_networkx_graph(pos_subgraph)
+    neg_nx_raw = to_networkx_graph(neg_subgraph)
 
     highlight_keys = set(highlight_keys or [])
+
+    def canonicalize_graph_nodes(G):
+        H = nx.Graph()
+
+        for node, attrs in G.nodes(data=True):
+            key = attrs.get(match_attr, attrs.get(name_attr, node))
+
+            if key not in H:
+                H.add_node(key, **attrs)
+            else:
+                for k, v in attrs.items():
+                    if k not in H.nodes[key]:
+                        H.nodes[key][k] = v
+
+        for u, v, attrs in G.edges(data=True):
+            ku = G.nodes[u].get(match_attr, G.nodes[u].get(name_attr, u))
+            kv = G.nodes[v].get(match_attr, G.nodes[v].get(name_attr, v))
+
+            if ku == kv:
+                continue
+
+            if H.has_edge(ku, kv):
+                old_w = H[ku][kv].get("weight", None)
+                new_w = attrs.get("weight", None)
+                if old_w is None and new_w is not None:
+                    H[ku][kv]["weight"] = new_w
+                elif old_w is not None and new_w is not None and abs(new_w) > abs(old_w):
+                    H[ku][kv]["weight"] = new_w
+            else:
+                H.add_edge(ku, kv, **attrs)
+
+        return H
+
+    pos_nx = canonicalize_graph_nodes(pos_nx_raw)
+    neg_nx = canonicalize_graph_nodes(neg_nx_raw)
 
     combined_graph = nx.Graph()
     combined_graph.add_nodes_from(pos_nx.nodes(data=True))
     combined_graph.add_nodes_from(neg_nx.nodes(data=True))
-    combined_graph.add_edges_from(pos_nx.edges())
-    combined_graph.add_edges_from(neg_nx.edges())
+    combined_graph.add_edges_from(pos_nx.edges(data=True))
+    combined_graph.add_edges_from(neg_nx.edges(data=True))
 
     # layout
     if layout == "spring":
@@ -1014,19 +983,24 @@ def _draw_signed_subgraphs(
         )
     elif layout == "kamada_kawai":
         pos = nx.kamada_kawai_layout(combined_graph)
+    elif layout == "graphviz_sfdp":
+        pos = nx.nx_pydot.graphviz_layout(combined_graph, prog="sfdp")
+    elif layout == "graphviz_neato":
+        pos = nx.nx_pydot.graphviz_layout(combined_graph, prog="neato")
     else:
-        pos = nx.spring_layout(combined_graph, seed=layout_seed)
+        raise ValueError(
+            "layout must be one of: spring, kamada_kawai, graphviz_sfdp, graphviz_neato"
+        )
 
     plt.figure(figsize=figsize)
 
-    # node colors
     node_colors = []
     for node in combined_graph.nodes():
         attrs = combined_graph.nodes[node]
         key = attrs.get(match_attr, attrs.get(name_attr, node))
         node_colors.append("red" if key in highlight_keys else "lightblue")
 
-    # labels: optionally only top-degree nodes
+    # labels
     if label_top_n is None:
         label_nodes = set(combined_graph.nodes())
     else:
@@ -1043,7 +1017,7 @@ def _draw_signed_subgraphs(
         pos,
         node_color=node_colors,
         node_size=node_size,
-        alpha=0.8,
+        alpha=0.9,
     )
     nx.draw_networkx_edges(
         combined_graph,
@@ -1081,6 +1055,98 @@ def _draw_signed_subgraphs(
     plt.tight_layout()
     plt.show()
 
+import igraph as ig
+
+def build_signed_graph_from_igraph(G_pos, G_neg, lambda_neg=1.0, neg_weight_mode="absolute"):
+    """
+    Build a single signed weighted igraph.Graph from separate positive/negative igraph graphs.
+
+    Parameters
+    ----------
+    G_pos : ig.Graph
+        Positive graph. Edge weights should be positive.
+    G_neg : ig.Graph
+        Negative graph. Edge weights should be:
+          - positive magnitudes if neg_weight_mode == "absolute"
+          - already signed (negative) if neg_weight_mode == "signed"
+    lambda_neg : float
+        Scaling factor for negative edges.
+    neg_weight_mode : {"absolute", "signed"}
+        How to interpret weights in G_neg.
+
+    Returns
+    -------
+    G_signed : ig.Graph
+        Single undirected signed weighted graph with edge attribute "weight".
+    """
+    if G_pos.vcount() != G_neg.vcount():
+        raise ValueError("G_pos and G_neg must have the same number of vertices.")
+
+    # Use undirected canonical edge keys
+    edge_weights = {}
+
+    def canonical_pair(u, v):
+        return (u, v) if u <= v else (v, u)
+
+    # Add positive edges
+    if "weight" in G_pos.es.attributes():
+        for e in G_pos.es:
+            u, v = e.tuple
+            key = canonical_pair(u, v)
+            edge_weights[key] = edge_weights.get(key, 0.0) + float(e["weight"])
+    else:
+        for e in G_pos.es:
+            u, v = e.tuple
+            key = canonical_pair(u, v)
+            edge_weights[key] = edge_weights.get(key, 0.0) + 1.0
+
+    # Add negative edges
+    if "weight" in G_neg.es.attributes():
+        for e in G_neg.es:
+            u, v = e.tuple
+            raw_weight = float(e["weight"])
+            key = canonical_pair(u, v)
+
+            if neg_weight_mode == "absolute":
+                neg_contribution = -lambda_neg * abs(raw_weight)
+            elif neg_weight_mode == "signed":
+                neg_contribution = lambda_neg * raw_weight
+            else:
+                raise ValueError("neg_weight_mode must be 'absolute' or 'signed'")
+
+            edge_weights[key] = edge_weights.get(key, 0.0) + neg_contribution
+    else:
+        for e in G_neg.es:
+            u, v = e.tuple
+            key = canonical_pair(u, v)
+
+            if neg_weight_mode == "absolute":
+                neg_contribution = -lambda_neg * 1.0
+            elif neg_weight_mode == "signed":
+                neg_contribution = -lambda_neg * 1.0
+            else:
+                raise ValueError("neg_weight_mode must be 'absolute' or 'signed'")
+
+            edge_weights[key] = edge_weights.get(key, 0.0) + neg_contribution
+
+    # Remove exactly-zero edges after cancellation
+    edge_weights = {k: w for k, w in edge_weights.items() if w != 0.0}
+
+    # Build signed graph
+    edge_list = list(edge_weights.keys())
+    weight_list = list(edge_weights.values())
+
+    G_signed = ig.Graph(n=G_pos.vcount(), edges=edge_list, directed=False)
+    G_signed.es["weight"] = weight_list
+
+    # Preserve node attributes if present
+    for attr in set(G_pos.vs.attributes()) | set(G_neg.vs.attributes()):
+        if attr in G_pos.vs.attributes():
+            G_signed.vs[attr] = list(G_pos.vs[attr])
+        elif attr in G_neg.vs.attributes():
+            G_signed.vs[attr] = list(G_neg.vs[attr])
+
+    return G_signed
 
 # =============================================================================
 # Visualization utilities

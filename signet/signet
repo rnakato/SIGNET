@@ -30,10 +30,18 @@ signet --pos ... --neg ... --method leiden-mod-alpha --out-prefix results/run1 -
 # Disable GMT
 signet --pos ... --neg ... --method leiden-mod-alpha --out-prefix results/run1 --no-gmt
 
-# MAT, Leiden modularity (alpha)
+# SNAP signed TSV (Epinions), Leiden modularity (alpha)
+signet --format snap --snap data/soc-sign-epinions.txt.gz --method leiden-mod-alpha \
+  --alpha 0.6 --resolution 1.0 --seed 12345 --out-prefix results/epinions_alpha06
+
+# SNAP signed TSV, single signed CPM
+signet --format snap --snap data/soc-sign-epinions.txt.gz --method leiden-cpm-single \
+  --lambda-neg 1.0 --gamma 0.5 --min-degree 2 --degree-mode union
+
+# MAT (MATLAB format), Leiden modularity (alpha)
 signet --format mat --mat data/epinions_data.mat --method leiden-mod-alpha --alpha 0.6 --resolution 1.0
 
-# MAT, single signed CPM
+# MAT (MATLAB format), single signed CPM
 signet --format mat --mat data/epinions_data.mat --method leiden-cpm-single --lambda-neg 1.0 --gamma 0.5
 """
 
@@ -97,6 +105,47 @@ def load_input_graphs(args):
             return G_pos, G_neg, meta
 
         raise ValueError(f"Unsupported method for TSV: {args.method}")
+
+    if args.format == "snap":
+        snap_path = Path(args.snap)
+        if not snap_path.exists():
+            raise FileNotFoundError(f"SNAP signed TSV not found: {snap_path}")
+
+        # Leiden 系は igraph 版を使う
+        if args.method.startswith("leiden"):
+            G_pos, G_neg = nr.load_snap_signed_tsv_igraph(
+                str(snap_path),
+                undirected=not args.directed,
+                conflict=args.conflict,
+                add_weights=not args.no_weights,
+                keep_self_loops=args.keep_self_loops,
+                min_degree=args.min_degree,
+                degree_mode=args.degree_mode,
+            )
+            meta["has_gene_id"] = "gene_id" in G_pos.vs.attributes()
+            meta["has_name"] = "name" in G_pos.vs.attributes()
+            meta["source"] = "snap"
+            meta["snap_path"] = str(snap_path)
+            return G_pos, G_neg, meta
+
+        # LouvainSigned は networkx 版
+        if args.method == "louvain":
+            if LouvainSigned is None:
+                raise ImportError("LouvainSigned is not importable.")
+            G_pos, G_neg = nr.load_snap_signed_tsv_nx(
+                str(snap_path),
+                undirected=not args.directed,
+                conflict=args.conflict,
+                add_weights=not args.no_weights,
+                keep_self_loops=args.keep_self_loops,
+                min_degree=args.min_degree,
+                degree_mode=args.degree_mode,
+            )
+            meta["source"] = "snap"
+            meta["snap_path"] = str(snap_path)
+            return G_pos, G_neg, meta
+
+        raise ValueError(f"Unsupported method for SNAP TSV: {args.method}")
 
     if args.format == "mat":
         from scipy.io import loadmat
@@ -225,6 +274,14 @@ def write_summary(out_path, args, G_pos, G_neg, gene_ids, membership):
             f.write(f"  neg              : {args.neg}\n")
             f.write(f"  thre_pos         : {args.thre_pos}\n")
             f.write(f"  thre_neg         : {args.thre_neg}\n")
+        elif args.format == "snap":
+            f.write(f"  snap             : {args.snap}\n")
+            f.write(f"  directed         : {args.directed}\n")
+            f.write(f"  conflict         : {args.conflict}\n")
+            f.write(f"  no_weights       : {args.no_weights}\n")
+            f.write(f"  keep_self_loops  : {args.keep_self_loops}\n")
+            f.write(f"  min_degree       : {args.min_degree}\n")
+            f.write(f"  degree_mode      : {args.degree_mode}\n")
         elif args.format == "mat":
             f.write(f"  mat              : {args.mat}\n")
             f.write(f"  pos_key          : {args.pos_key}\n")
@@ -665,14 +722,31 @@ def build_parser():
     )
 
     # Input
-    p.add_argument("--format", choices=["tsv", "mat"], default="tsv",
-                   help="Input format (default: tsv)")
+    p.add_argument("--format", choices=["tsv", "snap", "mat"], default="tsv",
+                   help="Input format: tsv, snap, mat (default: tsv)")
 
     # TSV args
     p.add_argument("--pos", type=str, help="Positive TSV file")
     p.add_argument("--neg", type=str, help="Negative TSV file")
     p.add_argument("--thre-pos", type=float, default=10.0, help="Threshold for positive TSV (default: 10)")
     p.add_argument("--thre-neg", type=float, default=5.0, help="Threshold for negative TSV (default: 5)")
+
+    # SNAP args
+    p.add_argument("--snap", type=str, help="SNAP signed TSV file (.txt or .txt.gz)")
+    p.add_argument("--directed", action="store_true",
+                    help="Treat SNAP edges as directed pairs (default: convert to undirected)")
+    p.add_argument("--conflict", choices=["both", "sum", "prefer_pos", "prefer_neg"],
+                    default="both",
+                    help="How to resolve conflicting signs on the same undirected pair (default: both)")
+    p.add_argument("--no-weights", action="store_true",
+                    help="Ignore multiplicity/count weights when loading SNAP signed TSV")
+    p.add_argument("--keep-self-loops", action="store_true",
+                    help="Keep self-loops in SNAP signed TSV (default: drop)")
+    p.add_argument("--min-degree", type=int, default=None,
+                    help="Remove nodes with degree < this threshold after loading SNAP graph")
+    p.add_argument("--degree-mode", choices=["union", "pos", "neg"], default="union",
+                    help="Degree basis for SNAP node filtering (default: union)")
+
 
     # MAT args
     p.add_argument("--mat", type=str, help="MAT file path")
@@ -717,6 +791,9 @@ def validate_args(args):
     if args.format == "tsv":
         if not args.pos or not args.neg:
             raise ValueError("--pos and --neg are required when --format tsv")
+    if args.format == "snap":
+        if not args.snap:
+            raise ValueError("--snap is required when --format snap")
     if args.format == "mat":
         if not args.mat:
             raise ValueError("--mat is required when --format mat")

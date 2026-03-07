@@ -1,5 +1,6 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
+tutorial/data/soc-sign-epinions.txt.gz
+tutorial/partition.tsv
+tutorial/results/
 
 # Distribution / packaging
 .Python
