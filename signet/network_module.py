@@ -761,6 +761,78 @@ def load_signed_graph_from_two_TSV_igraph(
 
     return g
 
+
+def build_signed_graph_from_igraph(G_pos, G_neg, lambda_neg=1.0, neg_weight_mode="absolute"):
+    if G_pos.vcount() != G_neg.vcount():
+        raise ValueError("G_pos and G_neg must have the same number of vertices.")
+
+    # Use undirected canonical edge keys
+    edge_weights = {}
+
+    def canonical_pair(u, v):
+        return (u, v) if u <= v else (v, u)
+
+    # Add positive edges
+    if "weight" in G_pos.es.attributes():
+        for e in G_pos.es:
+            u, v = e.tuple
+            key = canonical_pair(u, v)
+            edge_weights[key] = edge_weights.get(key, 0.0) + float(e["weight"])
+    else:
+        for e in G_pos.es:
+            u, v = e.tuple
+            key = canonical_pair(u, v)
+            edge_weights[key] = edge_weights.get(key, 0.0) + 1.0
+
+    # Add negative edges
+    if "weight" in G_neg.es.attributes():
+        for e in G_neg.es:
+            u, v = e.tuple
+            raw_weight = float(e["weight"])
+            key = canonical_pair(u, v)
+
+            if neg_weight_mode == "absolute":
+                neg_contribution = -lambda_neg * abs(raw_weight)
+            elif neg_weight_mode == "signed":
+                neg_contribution = lambda_neg * raw_weight
+            else:
+                raise ValueError("neg_weight_mode must be 'absolute' or 'signed'")
+
+            edge_weights[key] = edge_weights.get(key, 0.0) + neg_contribution
+    else:
+        for e in G_neg.es:
+            u, v = e.tuple
+            key = canonical_pair(u, v)
+
+            if neg_weight_mode == "absolute":
+                neg_contribution = -lambda_neg * 1.0
+            elif neg_weight_mode == "signed":
+                neg_contribution = -lambda_neg * 1.0
+            else:
+                raise ValueError("neg_weight_mode must be 'absolute' or 'signed'")
+
+            edge_weights[key] = edge_weights.get(key, 0.0) + neg_contribution
+
+    # Remove exactly-zero edges after cancellation
+    edge_weights = {k: w for k, w in edge_weights.items() if w != 0.0}
+
+    # Build signed graph
+    edge_list = list(edge_weights.keys())
+    weight_list = list(edge_weights.values())
+
+    G_signed = ig.Graph(n=G_pos.vcount(), edges=edge_list, directed=False)
+    G_signed.es["weight"] = weight_list
+
+    # Preserve node attributes if present
+    for attr in set(G_pos.vs.attributes()) | set(G_neg.vs.attributes()):
+        if attr in G_pos.vs.attributes():
+            G_signed.vs[attr] = list(G_pos.vs[attr])
+        elif attr in G_neg.vs.attributes():
+            G_signed.vs[attr] = list(G_neg.vs[attr])
+
+    return G_signed
+
+
 # =============================================================================
 # Community / weight utilities
 # =============================================================================
